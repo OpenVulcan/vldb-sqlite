@@ -4,7 +4,6 @@ use crate::fts::{
 };
 use crate::logging::ServiceLogger;
 use crate::pb::sqlite_service_server::SqliteService;
-use crate::pb::sqlite_value::Kind as ProtoSqliteValueKind;
 use crate::pb::{
     DeleteFtsDocumentRequest, DictionaryMutationResponse, EnsureFtsIndexRequest,
     EnsureFtsIndexResponse, ExecuteBatchItem, ExecuteBatchRequest, ExecuteBatchResponse,
@@ -19,31 +18,31 @@ use crate::runtime::{
     SqliteHardeningOptions, SqliteOpenOptions, SqlitePragmaOptions, apply_sqlite_connection_pragmas,
     build_sqlite_open_flags, open_sqlite_connection,
 };
+use crate::sql_exec::{
+    DEFAULT_IPC_CHUNK_BYTES, QueryStreamChunkWriter, QueryStreamMetrics, SqlExecCoreError,
+    execute_batch as execute_batch_core,
+    execute_script as execute_script_core,
+    parse_batch_params as parse_batch_params_core,
+    parse_request_params as parse_request_params_core,
+    query_json as query_json_core, query_stream_with_writer as query_stream_with_writer_core,
+};
 use crate::tokenizer::{
     TokenizerMode, list_custom_words, remove_custom_word, tokenize_text, upsert_custom_word,
 };
-use arrow::array::{ArrayRef, BinaryBuilder, Float64Builder, Int64Builder, StringBuilder};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::ipc::writer::StreamWriter;
-use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
 use rusqlite::ffi::ErrorCode as SqliteErrorCode;
-use rusqlite::types::{ToSql, Value as SqliteValue, ValueRef as SqliteValueRef};
 use rusqlite::{Connection, Error as RusqliteError, InterruptHandle, OpenFlags};
-use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
-use std::io;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::{io, io::Write};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::{AsciiMetadataValue, MetadataMap};
 use tonic::{Code, Request, Response, Status};
 
 const STREAM_CHANNEL_CAPACITY: usize = 8;
-const DEFAULT_IPC_CHUNK_BYTES: usize = 1024 * 1024;
 const RETRYABLE_METADATA_KEY: &str = "x-vldb-retryable";
 const SQLITE_CODE_METADATA_KEY: &str = "x-vldb-sqlite-code";
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -132,12 +131,89 @@ impl Drop for WorkerCompletionSignal {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum ArrowColumnKind {
-    Int64,
-    Float64,
-    Utf8,
-    Binary,
+/// gRPC QueryStream 的 Arrow IPC chunk 输出器。
+/// Arrow IPC chunk writer used by the gRPC QueryStream path.
+struct GrpcChunkWriter {
+    sender: mpsc::Sender<Result<QueryResponse, Status>>,
+    pending: Vec<u8>,
+    target_chunk_size: usize,
+    emitted_chunks: usize,
+    emitted_bytes: usize,
+}
+
+impl GrpcChunkWriter {
+    /// 创建一个面向 gRPC sender 的 chunk writer。
+    /// Create a chunk writer backed by a gRPC sender.
+    fn new(sender: mpsc::Sender<Result<QueryResponse, Status>>, target_chunk_size: usize) -> Self {
+        let chunk_size = target_chunk_size.max(64 * 1024);
+        Self {
+            sender,
+            pending: Vec::with_capacity(chunk_size),
+            target_chunk_size: chunk_size,
+            emitted_chunks: 0,
+            emitted_bytes: 0,
+        }
+    }
+
+    /// 尝试把满足阈值的 chunk 推送到 gRPC 流。
+    /// Try to push chunks that already reached the emission threshold into the gRPC stream.
+    fn emit_full_chunks(&mut self) -> io::Result<()> {
+        while self.pending.len() >= self.target_chunk_size {
+            let remainder = self.pending.split_off(self.target_chunk_size);
+            let chunk = std::mem::replace(&mut self.pending, remainder);
+            self.send_chunk(chunk)?;
+        }
+        Ok(())
+    }
+
+    /// 推送剩余未满阈值的 chunk。
+    /// Push the remaining chunk that did not reach the target threshold.
+    fn emit_remaining(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = std::mem::take(&mut self.pending);
+        self.send_chunk(chunk)
+    }
+
+    /// 发送单个 Arrow IPC chunk 到 gRPC channel。
+    /// Send a single Arrow IPC chunk into the gRPC channel.
+    fn send_chunk(&mut self, chunk: Vec<u8>) -> io::Result<()> {
+        self.emitted_chunks += 1;
+        self.emitted_bytes += chunk.len();
+        self.sender
+            .blocking_send(Ok(QueryResponse {
+                arrow_ipc_chunk: Bytes::from(chunk),
+            }))
+            .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, format!("gRPC stream closed: {error}")))
+    }
+}
+
+impl Write for GrpcChunkWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        self.pending.extend_from_slice(buf);
+        self.emit_full_chunks()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit_remaining()
+    }
+}
+
+impl QueryStreamChunkWriter for GrpcChunkWriter {
+    fn emitted_chunk_count(&self) -> u64 {
+        u64::try_from(self.emitted_chunks).unwrap_or(u64::MAX)
+    }
+
+    fn emitted_total_bytes(&self) -> u64 {
+        u64::try_from(self.emitted_bytes).unwrap_or(u64::MAX)
+    }
 }
 
 #[derive(Debug)]
@@ -153,12 +229,6 @@ impl RequestFailure {
     fn sqlite(prefix: &'static str, error: RusqliteError) -> Self {
         Self::Sqlite { prefix, error }
     }
-}
-
-#[derive(Copy, Clone, Debug)]
-struct StreamMetrics {
-    emitted_chunks: usize,
-    emitted_bytes: usize,
 }
 
 impl SqliteConnectionPool {
@@ -875,49 +945,20 @@ fn run_execute_script(
         let _ = tx.send(conn.get_interrupt_handle());
     }
 
-    let result = (|| -> Result<ExecuteResponse, RequestFailure> {
+    let result = (|| -> Result<ExecuteResponse, SqlExecCoreError> {
         set_request_stage(&context, "parsing_params");
-        let bound_values =
-            parse_request_params(&params, &params_json).map_err(RequestFailure::Status)?;
-
-        if bound_values.is_empty() {
-            set_request_stage(&context, "executing_batch");
-            conn.execute_batch(&sql)
-                .map_err(|err| RequestFailure::sqlite("sqlite execute_batch failed", err))?;
-
-            let rows_changed = i64::try_from(conn.changes()).unwrap_or(i64::MAX);
-            return Ok(ExecuteResponse {
-                success: true,
-                message: "script executed successfully".to_string(),
-                rows_changed,
-                last_insert_rowid: conn.last_insert_rowid(),
-            });
-        }
-
-        if has_multiple_sql_statements(&sql) {
-            return Err(RequestFailure::Status(Status::invalid_argument(
-                "flat params or params_json are only supported for a single SQL statement",
-            )));
-        }
-
-        set_request_stage(&context, "preparing_statement");
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|err| RequestFailure::sqlite("sqlite prepare failed", err))?;
-        let params = bind_values_as_params(&bound_values);
+        let bound_values = parse_request_params_core(&params, &params_json)?;
         set_request_stage(&context, "executing_statement");
-        let rows_changed = stmt
-            .execute(params.as_slice())
-            .map_err(|err| RequestFailure::sqlite("sqlite execute failed", err))?;
+        let response = execute_script_core(conn, &sql, &bound_values)?;
 
         Ok(ExecuteResponse {
-            success: true,
-            message: format!("statement executed successfully (rows_changed={rows_changed})"),
-            rows_changed: i64::try_from(rows_changed).unwrap_or(i64::MAX),
-            last_insert_rowid: conn.last_insert_rowid(),
+            success: response.success,
+            message: response.message,
+            rows_changed: response.rows_changed,
+            last_insert_rowid: response.last_insert_rowid,
         })
     })();
-    let result = result.map_err(|failure| finalize_request_failure(&context, conn, failure));
+    let result = result.map_err(|failure| finalize_sql_exec_failure(&context, conn, failure));
 
     match &result {
         Ok(response) => log_request_succeeded(&context, response.message.as_str()),
@@ -939,18 +980,19 @@ fn run_execute_batch(
         let _ = tx.send(conn.get_interrupt_handle());
     }
 
-    let result = (|| -> Result<ExecuteBatchResponse, RequestFailure> {
-        if has_multiple_sql_statements(&sql) {
-            return Err(RequestFailure::Status(Status::invalid_argument(
-                "execute_batch only supports a single SQL statement",
-            )));
-        }
-
+    let result = (|| -> Result<ExecuteBatchResponse, SqlExecCoreError> {
         set_request_stage(&context, "parsing_batch_params");
-        let batch_params = parse_batch_params(&items).map_err(RequestFailure::Status)?;
-        execute_prepared_batch(conn, &context, &sql, &batch_params)
+        let batch_params = parse_batch_params_core(&items)?;
+        let response = execute_batch_core(conn, &sql, &batch_params)?;
+        Ok(ExecuteBatchResponse {
+            success: response.success,
+            message: response.message,
+            rows_changed: response.rows_changed,
+            last_insert_rowid: response.last_insert_rowid,
+            statements_executed: response.statements_executed,
+        })
     })();
-    let result = result.map_err(|failure| finalize_request_failure(&context, conn, failure));
+    let result = result.map_err(|failure| finalize_sql_exec_failure(&context, conn, failure));
 
     match &result {
         Ok(response) => log_request_succeeded(&context, response.message.as_str()),
@@ -973,55 +1015,17 @@ fn run_query_json(
         let _ = tx.send(conn.get_interrupt_handle());
     }
 
-    let result = (|| -> Result<QueryJsonResponse, RequestFailure> {
+    let result = (|| -> Result<QueryJsonResponse, SqlExecCoreError> {
         set_request_stage(&context, "parsing_params");
-        let bound_values =
-            parse_request_params(&params, &params_json).map_err(RequestFailure::Status)?;
-        if has_multiple_sql_statements(&sql) {
-            return Err(RequestFailure::Status(Status::invalid_argument(
-                "query_json only supports a single SQL statement",
-            )));
-        }
-
-        set_request_stage(&context, "preparing_statement");
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|err| RequestFailure::sqlite("sqlite prepare failed", err))?;
-        let column_names = stmt
-            .column_names()
-            .into_iter()
-            .map(|name| name.to_string())
-            .collect::<Vec<_>>();
-        let params = bind_values_as_params(&bound_values);
+        let bound_values = parse_request_params_core(&params, &params_json)?;
         set_request_stage(&context, "executing_query");
-        let mut rows = stmt
-            .query(params.as_slice())
-            .map_err(|err| RequestFailure::sqlite("sqlite query failed", err))?;
+        let response = query_json_core(conn, &sql, &bound_values)?;
 
-        let mut json_rows = Vec::<JsonValue>::new();
-        set_request_stage(&context, "fetching_rows");
-        while let Some(row) = rows
-            .next()
-            .map_err(|err| RequestFailure::sqlite("sqlite row fetch failed", err))?
-        {
-            let mut object = JsonMap::new();
-            for (index, column_name) in column_names.iter().enumerate() {
-                let value = row
-                    .get_ref(index)
-                    .map_err(|err| RequestFailure::sqlite("sqlite value access failed", err))?;
-                object.insert(column_name.clone(), sqlite_value_ref_to_json(value));
-            }
-            json_rows.push(JsonValue::Object(object));
-        }
-
-        set_request_stage(&context, "serializing_json");
-        let json_data = serde_json::to_string(&json_rows).map_err(|err| {
-            RequestFailure::Status(status_internal("serialize JSON result failed", err))
-        })?;
-
-        Ok(QueryJsonResponse { json_data })
+        Ok(QueryJsonResponse {
+            json_data: response.json_data,
+        })
     })();
-    let result = result.map_err(|failure| finalize_request_failure(&context, conn, failure));
+    let result = result.map_err(|failure| finalize_sql_exec_failure(&context, conn, failure));
 
     match &result {
         Ok(response) => log_request_succeeded(
@@ -1399,8 +1403,6 @@ fn tokenizer_mode_from_proto(raw_mode: i32) -> Result<TokenizerMode, Status> {
     }
 }
 
-const STREAMING_BATCH_ROWS: usize = 1000;
-
 fn run_query_streaming(
     context: RequestLogContext,
     mut lease: ConnectionLease,
@@ -1415,155 +1417,59 @@ fn run_query_streaming(
         let _ = tx.send(conn.get_interrupt_handle());
     }
 
-    let result = (|| -> Result<(), RequestFailure> {
+    let result = (|| -> Result<QueryStreamMetrics, SqlExecCoreError> {
         set_request_stage(&context, "parsing_params");
-        let bound_values =
-            parse_request_params(&params, &params_json).map_err(RequestFailure::Status)?;
-        if has_multiple_sql_statements(&sql) {
-            return Err(RequestFailure::Status(Status::invalid_argument(
-                "query_stream only supports a single SQL statement",
-            )));
-        }
-
-        set_request_stage(&context, "preparing_statement");
-        let mut stmt = conn
-            .prepare(&sql)
-            .map_err(|err| RequestFailure::sqlite("sqlite prepare failed", err))?;
-        let columns = stmt.columns();
-        let column_names = columns
-            .iter()
-            .map(|column| column.name().to_string())
-            .collect::<Vec<_>>();
-        let declared_types = columns
-            .iter()
-            .map(|column| column.decl_type().map(|value| value.to_string()))
-            .collect::<Vec<_>>();
-        let params = bind_values_as_params(&bound_values);
+        let bound_values = parse_request_params_core(&params, &params_json)?;
         set_request_stage(&context, "executing_query");
-        let mut rows = stmt
-            .query(params.as_slice())
-            .map_err(|err| RequestFailure::sqlite("sqlite query failed", err))?;
-
-        let mut chunk_writer = Some(GrpcChunkWriter::new(tx, DEFAULT_IPC_CHUNK_BYTES));
-        let mut ipc_writer: Option<StreamWriter<GrpcChunkWriter>> = None;
-        let mut schema: Option<Arc<Schema>> = None;
-        let mut column_kinds: Option<Vec<ArrowColumnKind>> = None;
-        let mut total_rows: usize = 0;
-
+        let grpc_writer = GrpcChunkWriter::new(tx, DEFAULT_IPC_CHUNK_BYTES);
+        let (_writer, metrics) = query_stream_with_writer_core(
+            conn,
+            &sql,
+            &bound_values,
+            grpc_writer,
+        )?;
         set_request_stage(&context, "streaming_batches");
-
-        loop {
-            let mut batch_rows = Vec::<Vec<SqliteValue>>::new();
-            while batch_rows.len() < STREAMING_BATCH_ROWS {
-                match rows
-                    .next()
-                    .map_err(|err| RequestFailure::sqlite("sqlite row fetch failed", err))?
-                {
-                    Some(row) => {
-                        let mut values = Vec::with_capacity(column_names.len());
-                        for index in 0..column_names.len() {
-                            let value = row.get_ref(index).map_err(|err| {
-                                RequestFailure::sqlite("sqlite value access failed", err)
-                            })?;
-                            values.push(SqliteValue::try_from(value).map_err(|err| {
-                                RequestFailure::sqlite(
-                                    "sqlite value conversion failed while materializing rows",
-                                    RusqliteError::FromSqlConversionFailure(
-                                        index,
-                                        value.data_type(),
-                                        Box::new(err),
-                                    ),
-                                )
-                            })?);
-                        }
-                        batch_rows.push(values);
-                    }
-                    None => break,
-                }
-            }
-
-            if batch_rows.is_empty() {
-                break;
-            }
-
-            total_rows += batch_rows.len();
-
-            if ipc_writer.is_none() {
-                column_kinds = Some(infer_column_kinds(&declared_types, &batch_rows));
-                schema = Some(Arc::new(Schema::new(
-                    column_names
-                        .iter()
-                        .zip(column_kinds.as_ref().unwrap().iter())
-                        .map(|(name, kind)| {
-                            Field::new(
-                                name,
-                                match kind {
-                                    ArrowColumnKind::Int64 => DataType::Int64,
-                                    ArrowColumnKind::Float64 => DataType::Float64,
-                                    ArrowColumnKind::Utf8 => DataType::Utf8,
-                                    ArrowColumnKind::Binary => DataType::Binary,
-                                },
-                                true,
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                )));
-
-                let writer = StreamWriter::try_new(chunk_writer.take().unwrap(), schema.as_ref().unwrap())
-                    .map_err(|err| {
-                        RequestFailure::Status(status_internal("arrow stream header write failed", err))
-                    })?;
-                ipc_writer = Some(writer);
-            }
-
-            let batch = RecordBatch::try_new(
-                Arc::clone(schema.as_ref().unwrap()),
-                build_arrow_arrays(column_kinds.as_ref().unwrap(), &batch_rows),
-            )
-            .map_err(|err| {
-                RequestFailure::Status(status_internal("arrow record batch build failed", err))
-            })?;
-
-            let writer = ipc_writer.as_mut().unwrap();
-            writer.write(&batch).map_err(|err| {
-                RequestFailure::Status(status_internal("arrow batch write failed", err))
-            })?;
-            writer.flush().map_err(|err| {
-                RequestFailure::Status(status_internal("arrow batch flush failed", err))
-            })?;
-        }
-
-        if let Some(mut writer) = ipc_writer {
-            writer.finish().map_err(|err| {
-                RequestFailure::Status(status_internal("arrow stream finish failed", err))
-            })?;
-            writer.flush().map_err(|err| {
-                RequestFailure::Status(status_internal("arrow final flush failed", err))
-            })?;
-
-            let metrics = writer.get_ref().metrics();
-            log_request_succeeded(
-                &context,
-                format!(
-                    "streamed {rows} rows in batches ({chunks} chunks, {bytes} bytes)",
-                    rows = total_rows,
-                    chunks = metrics.emitted_chunks,
-                    bytes = metrics.emitted_bytes,
-                ),
-            );
-        } else {
-            log_request_succeeded(&context, "streamed 0 rows (empty result)");
-        }
-
-        Ok(())
+        Ok(metrics)
     })();
-    let result = result.map_err(|failure| finalize_request_failure(&context, conn, failure));
+    let result = result.map_err(|failure| finalize_sql_exec_failure(&context, conn, failure));
 
-    if let Err(status) = &result {
-        log_request_failed(&context, status);
+    match &result {
+        Ok(metrics) => {
+            if metrics.chunk_count > 0 {
+                log_request_succeeded(
+                    &context,
+                    format!(
+                        "streamed {rows} rows in batches ({chunks} chunks, {bytes} bytes)",
+                        rows = metrics.row_count,
+                        chunks = metrics.chunk_count,
+                        bytes = metrics.total_bytes,
+                    ),
+                );
+            } else {
+                log_request_succeeded(&context, "streamed 0 rows (empty result)");
+            }
+        }
+        Err(status) => {
+            log_request_failed(&context, status);
+        }
     }
 
-    result
+    result.map(|_| ())
+}
+
+fn finalize_sql_exec_failure(
+    context: &RequestLogContext,
+    conn: &mut Connection,
+    failure: SqlExecCoreError,
+) -> Status {
+    match failure {
+        SqlExecCoreError::InvalidArgument(message) => Status::invalid_argument(message),
+        SqlExecCoreError::Internal(message) => Status::internal(message),
+        SqlExecCoreError::Sqlite { prefix, error } => {
+            best_effort_rollback(context, conn);
+            sqlite_status(prefix, &error)
+        }
+    }
 }
 
 fn finalize_request_failure(
@@ -1773,421 +1679,6 @@ fn is_no_active_transaction_error(error_message: &str) -> bool {
         || lowered.contains("cannot rollback - no transaction is active")
 }
 
-fn parse_request_params(
-    params: &[ProtoSqliteValue],
-    params_json: &str,
-) -> Result<Vec<SqliteValue>, Status> {
-    if !params.is_empty() {
-        if !params_json.trim().is_empty() {
-            return Err(Status::invalid_argument(
-                "provide either flat params or params_json, but not both",
-            ));
-        }
-
-        return params
-            .iter()
-            .map(proto_param_to_sqlite_value)
-            .collect::<Result<Vec<_>, _>>();
-    }
-
-    parse_legacy_params_json(params_json)
-}
-
-fn parse_batch_params(items: &[ExecuteBatchItem]) -> Result<Vec<Vec<SqliteValue>>, Status> {
-    items
-        .iter()
-        .map(|item| parse_request_params(&item.params, ""))
-        .collect()
-}
-
-fn parse_legacy_params_json(params_json: &str) -> Result<Vec<SqliteValue>, Status> {
-    if params_json.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let params = serde_json::from_str::<JsonValue>(params_json).map_err(|err| {
-        Status::invalid_argument(format!(
-            "params_json must be a JSON array of scalar values: {err}"
-        ))
-    })?;
-
-    let items = params.as_array().ok_or_else(|| {
-        Status::invalid_argument("params_json must be a JSON array of scalar values")
-    })?;
-
-    items
-        .iter()
-        .cloned()
-        .map(json_param_to_sqlite_value)
-        .collect()
-}
-
-fn proto_param_to_sqlite_value(value: &ProtoSqliteValue) -> Result<SqliteValue, Status> {
-    match value.kind.as_ref() {
-        Some(ProtoSqliteValueKind::Int64Value(value)) => Ok(SqliteValue::Integer(*value)),
-        Some(ProtoSqliteValueKind::Float64Value(value)) => Ok(SqliteValue::Real(*value)),
-        Some(ProtoSqliteValueKind::StringValue(value)) => Ok(SqliteValue::Text(value.clone())),
-        Some(ProtoSqliteValueKind::BytesValue(value)) => Ok(SqliteValue::Blob(value.clone())),
-        Some(ProtoSqliteValueKind::BoolValue(value)) => Ok(SqliteValue::Integer(i64::from(*value))),
-        Some(ProtoSqliteValueKind::NullValue(_)) => Ok(SqliteValue::Null),
-        None => Err(Status::invalid_argument(
-            "SqliteValue.kind must be set for every bound parameter",
-        )),
-    }
-}
-
-fn json_param_to_sqlite_value(value: JsonValue) -> Result<SqliteValue, Status> {
-    match value {
-        JsonValue::Null => Ok(SqliteValue::Null),
-        JsonValue::Bool(value) => Ok(SqliteValue::Integer(i64::from(value))),
-        JsonValue::Number(value) => {
-            if let Some(value) = value.as_i64() {
-                Ok(SqliteValue::Integer(value))
-            } else if let Some(value) = value.as_u64() {
-                Ok(SqliteValue::Integer(i64::try_from(value).map_err(|_| {
-                    Status::invalid_argument(
-                        "params_json contains an unsigned integer larger than SQLite signed 64-bit range",
-                    )
-                })?))
-            } else if let Some(value) = value.as_f64() {
-                Ok(SqliteValue::Real(value))
-            } else {
-                Err(Status::invalid_argument(
-                    "params_json contains an unsupported numeric value",
-                ))
-            }
-        }
-        JsonValue::String(value) => Ok(SqliteValue::Text(value)),
-        JsonValue::Array(_) | JsonValue::Object(_) => Err(Status::invalid_argument(
-            "params_json only supports scalar JSON values (null, bool, number, string)",
-        )),
-    }
-}
-
-fn bind_values_as_params(values: &[SqliteValue]) -> Vec<&dyn ToSql> {
-    values.iter().map(|value| value as &dyn ToSql).collect()
-}
-
-fn execute_prepared_batch(
-    conn: &mut Connection,
-    context: &RequestLogContext,
-    sql: &str,
-    batch_params: &[Vec<SqliteValue>],
-) -> Result<ExecuteBatchResponse, RequestFailure> {
-    set_request_stage(context, "beginning_transaction");
-    conn.execute_batch("BEGIN TRANSACTION")
-        .map_err(|err| RequestFailure::sqlite("sqlite BEGIN TRANSACTION failed", err))?;
-
-    set_request_stage(context, "preparing_statement");
-    let mut stmt = conn
-        .prepare(sql)
-        .map_err(|err| RequestFailure::sqlite("sqlite prepare failed", err))?;
-
-    let mut rows_changed = 0_i64;
-    set_request_stage(context, "executing_batch_items");
-    for params in batch_params {
-        let params = bind_values_as_params(params);
-        let changed = stmt
-            .execute(params.as_slice())
-            .map_err(|err| RequestFailure::sqlite("sqlite execute failed", err))?;
-        rows_changed = rows_changed.saturating_add(i64::try_from(changed).unwrap_or(i64::MAX));
-    }
-
-    drop(stmt);
-
-    set_request_stage(context, "committing_transaction");
-    conn.execute_batch("COMMIT")
-        .map_err(|err| RequestFailure::sqlite("sqlite COMMIT failed", err))?;
-
-    Ok(ExecuteBatchResponse {
-        success: true,
-        message: format!(
-            "batch executed successfully (statements_executed={} rows_changed={rows_changed})",
-            batch_params.len()
-        ),
-        rows_changed,
-        last_insert_rowid: conn.last_insert_rowid(),
-        statements_executed: i64::try_from(batch_params.len()).unwrap_or(i64::MAX),
-    })
-}
-
-fn has_multiple_sql_statements(sql: &str) -> bool {
-    let chars: Vec<char> = sql.chars().collect();
-    let len = chars.len();
-    let mut i = 0;
-    let mut statement_count = 0;
-    let mut has_content = false;
-
-    while i < len {
-        match chars[i] {
-            '\'' => {
-                has_content = true;
-                i += 1;
-                while i < len {
-                    if chars[i] == '\'' {
-                        if i + 1 < len && chars[i + 1] == '\'' {
-                            i += 2; // escaped ''
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            '"' => {
-                has_content = true;
-                i += 1;
-                while i < len {
-                    if chars[i] == '"' {
-                        if i + 1 < len && chars[i + 1] == '"' {
-                            i += 2; // escaped ""
-                        } else {
-                            i += 1;
-                            break;
-                        }
-                    } else {
-                        i += 1;
-                    }
-                }
-            }
-            '-' if i + 1 < len && chars[i + 1] == '-' => {
-                // line comment
-                i += 2;
-                while i < len && chars[i] != '\n' {
-                    i += 1;
-                }
-            }
-            '/' if i + 1 < len && chars[i + 1] == '*' => {
-                // block comment
-                i += 2;
-                while i + 1 < len {
-                    if chars[i] == '*' && chars[i + 1] == '/' {
-                        i += 2;
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            ';' => {
-                if has_content {
-                    statement_count += 1;
-                    if statement_count > 1 {
-                        return true;
-                    }
-                }
-                has_content = false;
-                i += 1;
-            }
-            c if !c.is_whitespace() => {
-                has_content = true;
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-
-    if has_content {
-        statement_count += 1;
-    }
-
-    statement_count > 1
-}
-
-fn sqlite_value_ref_to_json(value: SqliteValueRef<'_>) -> JsonValue {
-    match SqliteValue::try_from(value) {
-        Ok(value) => sqlite_value_to_json(&value),
-        Err(_) => JsonValue::Null,
-    }
-}
-
-fn sqlite_value_to_json(value: &SqliteValue) -> JsonValue {
-    match value {
-        SqliteValue::Null => JsonValue::Null,
-        SqliteValue::Integer(value) => JsonValue::from(*value),
-        SqliteValue::Real(value) => json_float(*value),
-        SqliteValue::Text(value) => JsonValue::String(value.clone()),
-        SqliteValue::Blob(value) => JsonValue::Array(
-            value
-                .iter()
-                .map(|byte| JsonValue::from(u64::from(*byte)))
-                .collect(),
-        ),
-    }
-}
-
-fn infer_column_kinds(
-    declared_types: &[Option<String>],
-    rows: &[Vec<SqliteValue>],
-) -> Vec<ArrowColumnKind> {
-    let column_count = declared_types.len();
-    let mut kinds = Vec::with_capacity(column_count);
-
-    for index in 0..column_count {
-        let mut current = declared_type_hint(declared_types[index].as_deref());
-        for row in rows {
-            current = merge_column_kind(current, &row[index]);
-        }
-        kinds.push(current.unwrap_or(ArrowColumnKind::Utf8));
-    }
-
-    kinds
-}
-
-fn declared_type_hint(value: Option<&str>) -> Option<ArrowColumnKind> {
-    let normalized = value?.trim().to_ascii_uppercase();
-
-    if normalized.contains("INT") || normalized.contains("BOOL") {
-        Some(ArrowColumnKind::Int64)
-    } else if normalized.contains("REAL")
-        || normalized.contains("FLOA")
-        || normalized.contains("DOUB")
-        || normalized.contains("NUMERIC")
-        || normalized.contains("DEC")
-    {
-        Some(ArrowColumnKind::Float64)
-    } else if normalized.contains("BLOB") {
-        Some(ArrowColumnKind::Binary)
-    } else if normalized.contains("CHAR")
-        || normalized.contains("CLOB")
-        || normalized.contains("TEXT")
-        || normalized.contains("JSON")
-        || normalized.contains("DATE")
-        || normalized.contains("TIME")
-    {
-        Some(ArrowColumnKind::Utf8)
-    } else {
-        None
-    }
-}
-
-fn merge_column_kind(
-    current: Option<ArrowColumnKind>,
-    value: &SqliteValue,
-) -> Option<ArrowColumnKind> {
-    match value {
-        SqliteValue::Null => current,
-        SqliteValue::Integer(_) => Some(match current {
-            None => ArrowColumnKind::Int64,
-            Some(ArrowColumnKind::Int64) => ArrowColumnKind::Int64,
-            Some(ArrowColumnKind::Float64) => ArrowColumnKind::Float64,
-            Some(ArrowColumnKind::Utf8) => ArrowColumnKind::Utf8,
-            Some(ArrowColumnKind::Binary) => ArrowColumnKind::Utf8,
-        }),
-        SqliteValue::Real(_) => Some(match current {
-            None => ArrowColumnKind::Float64,
-            Some(ArrowColumnKind::Int64) => ArrowColumnKind::Float64,
-            Some(ArrowColumnKind::Float64) => ArrowColumnKind::Float64,
-            Some(ArrowColumnKind::Utf8) => ArrowColumnKind::Utf8,
-            Some(ArrowColumnKind::Binary) => ArrowColumnKind::Utf8,
-        }),
-        SqliteValue::Text(_) => Some(ArrowColumnKind::Utf8),
-        SqliteValue::Blob(_) => Some(match current {
-            None => ArrowColumnKind::Binary,
-            Some(ArrowColumnKind::Binary) => ArrowColumnKind::Binary,
-            _ => ArrowColumnKind::Utf8,
-        }),
-    }
-}
-
-fn build_arrow_arrays(kinds: &[ArrowColumnKind], rows: &[Vec<SqliteValue>]) -> Vec<ArrayRef> {
-    let mut arrays = Vec::<ArrayRef>::with_capacity(kinds.len());
-
-    for (index, kind) in kinds.iter().enumerate() {
-        match kind {
-            ArrowColumnKind::Int64 => {
-                let mut builder = Int64Builder::with_capacity(rows.len());
-                for row in rows {
-                    match &row[index] {
-                        SqliteValue::Null => builder.append_null(),
-                        SqliteValue::Integer(value) => builder.append_value(*value),
-                        SqliteValue::Real(value) => builder.append_value(*value as i64),
-                        SqliteValue::Text(_) | SqliteValue::Blob(_) => builder.append_null(),
-                    }
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-            ArrowColumnKind::Float64 => {
-                let mut builder = Float64Builder::with_capacity(rows.len());
-                for row in rows {
-                    match &row[index] {
-                        SqliteValue::Null => builder.append_null(),
-                        SqliteValue::Integer(value) => builder.append_value(*value as f64),
-                        SqliteValue::Real(value) => builder.append_value(*value),
-                        SqliteValue::Text(_) | SqliteValue::Blob(_) => builder.append_null(),
-                    }
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-            ArrowColumnKind::Utf8 => {
-                let mut builder = StringBuilder::new();
-                for row in rows {
-                    match sqlite_value_to_text(&row[index]) {
-                        Some(value) => builder.append_value(value),
-                        None => builder.append_null(),
-                    }
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-            ArrowColumnKind::Binary => {
-                let mut builder = BinaryBuilder::new();
-                for row in rows {
-                    match &row[index] {
-                        SqliteValue::Null => builder.append_null(),
-                        SqliteValue::Blob(value) => builder.append_value(value),
-                        other => builder.append_value(
-                            sqlite_value_to_text(other).unwrap_or_default().as_bytes(),
-                        ),
-                    }
-                }
-                arrays.push(Arc::new(builder.finish()));
-            }
-        }
-    }
-
-    arrays
-}
-
-fn sqlite_value_to_text(value: &SqliteValue) -> Option<String> {
-    match value {
-        SqliteValue::Null => None,
-        SqliteValue::Integer(value) => Some(value.to_string()),
-        SqliteValue::Real(value) => Some(format_float(*value)),
-        SqliteValue::Text(value) => Some(value.clone()),
-        SqliteValue::Blob(value) => Some(format!("x'{}'", blob_to_hex(value))),
-    }
-}
-
-fn blob_to_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut output = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        output.push(char::from(HEX[(byte >> 4) as usize]));
-        output.push(char::from(HEX[(byte & 0x0f) as usize]));
-    }
-    output
-}
-
-fn json_float(value: f64) -> JsonValue {
-    if value.is_nan() || value.is_infinite() {
-        return JsonValue::String(format_float(value));
-    }
-    JsonNumber::from_f64(value)
-        .map(JsonValue::Number)
-        .unwrap_or_else(|| JsonValue::String(format_float(value)))
-}
-
-fn format_float(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.1}")
-    } else {
-        value.to_string()
-    }
-}
-
 fn response_with_default_metadata<T>(payload: T) -> Response<T> {
     let mut response = Response::new(payload);
     response.metadata_mut().insert(
@@ -2195,10 +1686,6 @@ fn response_with_default_metadata<T>(payload: T) -> Response<T> {
         AsciiMetadataValue::from_static("false"),
     );
     response
-}
-
-fn status_internal<E: std::fmt::Display>(prefix: &str, error: E) -> Status {
-    Status::internal(format!("{prefix}: {error}"))
 }
 
 fn build_request_context<T>(
@@ -2536,96 +2023,16 @@ fn format_optional_duration(duration: Option<Duration>) -> String {
         .unwrap_or_else(|| "none".to_string())
 }
 
-struct GrpcChunkWriter {
-    tx: mpsc::Sender<Result<QueryResponse, Status>>,
-    pending: Vec<u8>,
-    target_chunk_size: usize,
-    emitted_chunks: usize,
-    emitted_bytes: usize,
-}
-
-impl GrpcChunkWriter {
-    fn new(tx: mpsc::Sender<Result<QueryResponse, Status>>, target_chunk_size: usize) -> Self {
-        let chunk_size = target_chunk_size.max(64 * 1024);
-        Self {
-            tx,
-            pending: Vec::with_capacity(chunk_size),
-            target_chunk_size: chunk_size,
-            emitted_chunks: 0,
-            emitted_bytes: 0,
-        }
-    }
-
-    fn metrics(&self) -> StreamMetrics {
-        StreamMetrics {
-            emitted_chunks: self.emitted_chunks,
-            emitted_bytes: self.emitted_bytes,
-        }
-    }
-
-    fn emit_full_chunks(&mut self) -> io::Result<()> {
-        while self.pending.len() >= self.target_chunk_size {
-            let remainder = self.pending.split_off(self.target_chunk_size);
-            let chunk = std::mem::replace(&mut self.pending, remainder);
-            self.send_chunk(chunk)?;
-        }
-        Ok(())
-    }
-
-    fn emit_remaining(&mut self) -> io::Result<()> {
-        if self.pending.is_empty() {
-            return Ok(());
-        }
-
-        let chunk = std::mem::take(&mut self.pending);
-        self.send_chunk(chunk)
-    }
-
-    fn send_chunk(&mut self, chunk: Vec<u8>) -> io::Result<()> {
-        let chunk_len = chunk.len();
-        self.tx
-            .blocking_send(Ok(QueryResponse {
-                arrow_ipc_chunk: Bytes::from(chunk),
-            }))
-            .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::BrokenPipe,
-                    format!("gRPC stream closed: {err}"),
-                )
-            })?;
-        self.emitted_chunks += 1;
-        self.emitted_bytes += chunk_len;
-
-        Ok(())
-    }
-}
-
-impl Write for GrpcChunkWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-
-        self.pending.extend_from_slice(buf);
-        self.emit_full_chunks()?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.emit_remaining()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_connection_pragmas, blob_to_hex, build_open_flags, declared_type_hint,
-        effective_connection_pool_size, has_multiple_sql_statements, infer_column_kinds,
-        mask_sql, parse_grpc_timeout_header, parse_request_params, preview_sql, sqlite_status,
+        apply_connection_pragmas, build_open_flags, effective_connection_pool_size, mask_sql,
+        parse_grpc_timeout_header, preview_sql, sqlite_status,
     };
     use crate::config::Config;
     use crate::pb::sqlite_value::Kind as ProtoSqliteValueKind;
     use crate::pb::{NullValue, SqliteValue as ProtoSqliteValue};
+    use crate::sql_exec::{has_multiple_sql_statements, parse_request_params};
     use rusqlite::Error as RusqliteError;
     use rusqlite::ffi::Error as SqliteFfiError;
     use rusqlite::ffi::ErrorCode as SqliteErrorCode;
@@ -2730,48 +2137,6 @@ mod tests {
         assert!(flags.contains(OpenFlags::SQLITE_OPEN_READ_ONLY));
         assert!(flags.contains(OpenFlags::SQLITE_OPEN_URI));
         assert!(!flags.contains(OpenFlags::SQLITE_OPEN_CREATE));
-    }
-
-    #[test]
-    fn declared_type_hint_maps_common_sqlite_types() {
-        assert_eq!(
-            declared_type_hint(Some("INTEGER")),
-            Some(super::ArrowColumnKind::Int64)
-        );
-        assert_eq!(
-            declared_type_hint(Some("REAL")),
-            Some(super::ArrowColumnKind::Float64)
-        );
-        assert_eq!(
-            declared_type_hint(Some("TEXT")),
-            Some(super::ArrowColumnKind::Utf8)
-        );
-        assert_eq!(
-            declared_type_hint(Some("BLOB")),
-            Some(super::ArrowColumnKind::Binary)
-        );
-    }
-
-    #[test]
-    fn infer_column_kinds_promotes_mixed_numeric_and_text_columns() {
-        let kinds = infer_column_kinds(
-            &[Some("INTEGER".to_string()), None],
-            &[
-                vec![SqliteValue::Integer(1), SqliteValue::Real(1.5)],
-                vec![
-                    SqliteValue::Integer(2),
-                    SqliteValue::Text("alpha".to_string()),
-                ],
-            ],
-        );
-
-        assert_eq!(kinds[0], super::ArrowColumnKind::Int64);
-        assert_eq!(kinds[1], super::ArrowColumnKind::Utf8);
-    }
-
-    #[test]
-    fn blob_hex_encoding_matches_sqlite_blob_literal_style() {
-        assert_eq!(blob_to_hex(&[0xDE, 0xAD, 0xBE, 0xEF]), "DEADBEEF");
     }
 
     #[test]
@@ -2935,14 +2300,5 @@ mod tests {
             mask_sql("SELECT /* hidden */ * FROM t"),
             "SELECT /* ... */ * FROM t"
         );
-    }
-
-    #[test]
-    fn json_float_handles_nan_and_inf() {
-        use super::json_float;
-        assert!(json_float(f64::NAN).is_string());
-        assert!(json_float(f64::INFINITY).is_string());
-        assert!(json_float(f64::NEG_INFINITY).is_string());
-        assert!(json_float(1.5).is_number());
     }
 }

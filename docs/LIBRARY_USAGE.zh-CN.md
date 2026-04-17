@@ -93,6 +93,14 @@
 - `vldb_sqlite_runtime_close_database`
 - `vldb_sqlite_database_destroy`
 - `vldb_sqlite_database_db_path`
+- `vldb_sqlite_database_execute_script`
+- `vldb_sqlite_database_execute_batch`
+- `vldb_sqlite_database_query_json`
+- `vldb_sqlite_database_query_stream`
+- `vldb_sqlite_execute_result_*`
+- `vldb_sqlite_query_json_result_*`
+- `vldb_sqlite_query_stream_*`
+- `vldb_sqlite_bytes_free`
 - `vldb_sqlite_database_tokenize_text`
 - `vldb_sqlite_database_upsert_custom_word`
 - `vldb_sqlite_database_remove_custom_word`
@@ -113,6 +121,12 @@
 - `vldb_sqlite_last_error_message`
 - `vldb_sqlite_clear_last_error`
 - `vldb_sqlite_json_is_null`
+- `vldb_sqlite_execute_script_json`
+- `vldb_sqlite_execute_batch_json`
+- `vldb_sqlite_query_json_json`
+- `vldb_sqlite_query_stream_json`
+- `vldb_sqlite_query_stream_chunk_json`
+- `vldb_sqlite_query_stream_close_json`
 - `vldb_sqlite_tokenize_text_json`
 - `vldb_sqlite_upsert_custom_word_json`
 - `vldb_sqlite_remove_custom_word_json`
@@ -209,6 +223,10 @@
     "runtime_create_default",
     "runtime_open_database",
     "runtime_close_database",
+    "database_execute_script",
+    "database_execute_batch",
+    "database_query_json",
+    "database_query_stream",
     "database_tokenize_text",
     "database_upsert_custom_word",
     "database_remove_custom_word",
@@ -218,6 +236,12 @@
     "database_upsert_fts_document",
     "database_delete_fts_document",
     "database_search_fts",
+    "execute_script_json",
+    "execute_batch_json",
+    "query_json_json",
+    "query_stream_json",
+    "query_stream_chunk_json",
+    "query_stream_close_json",
     "tokenize_text_json",
     "upsert_custom_word_json",
     "remove_custom_word_json",
@@ -248,6 +272,55 @@
 - 不依赖配置文件
 - 支持同一进程内动态打开多个库
 - 不会反向干扰 gRPC 的单库配置模式
+
+### 2. JSON 兼容层里的 QueryStream
+
+JSON 兼容层的 `QueryStream` 现在也改成了句柄化模式：
+
+1. `vldb_sqlite_query_stream_json()`  
+   返回：
+   - `stream_id`
+   - `row_count`
+   - `chunk_count`
+   - `total_bytes`
+2. `vldb_sqlite_query_stream_chunk_json()`  
+   按 `stream_id + index` 逐块读取 Arrow IPC chunk，
+   返回：
+   - `byte_count`
+   - `chunk_base64`
+3. `vldb_sqlite_query_stream_close_json()`  
+   主动释放该次查询缓存的 chunk 结果
+
+这样可以避免 JSON 兼容层把所有 chunk 一次性塞进单个 JSON 字符串；单个 chunk 也不再被编码成 JSON 数字数组，而是通过 `chunk_base64` 返回，降低体积膨胀与 CPU 开销。
+
+### 1.1 通用 SQL 主接口
+
+当前库模式已经补齐与 gRPC 对应的通用 SQL 主接口：
+
+- `vldb_sqlite_database_execute_script`
+- `vldb_sqlite_database_execute_batch`
+- `vldb_sqlite_database_query_json`
+- `vldb_sqlite_database_query_stream`
+
+其中：
+
+- `execute_script/query_json/query_stream`
+  - 同时支持 typed params 与 `params_json` 兼容输入
+- `execute_batch`
+  - 使用 `VldbSqliteFfiValueSlice[]` 表达多组参数
+- `query_stream`
+  - 返回 `QueryStream` 结果句柄，调用方通过 chunk getter 逐块读取 Arrow IPC 数据
+  - chunk 释放通过 `vldb_sqlite_bytes_free`
+
+#### QueryStream chunk 读取与释放
+
+`vldb_sqlite_database_query_stream` 不会把大结果一次性拼成单个字符串，而是返回流结果句柄：
+
+1. 用 `vldb_sqlite_query_stream_chunk_count` 获取 chunk 数量
+2. 用 `vldb_sqlite_query_stream_get_chunk` 逐块读取 `VldbSqliteByteBuffer`
+3. 每次读取完后，调用 `vldb_sqlite_bytes_free` 释放该 chunk
+
+这样 Go/C 宿主可以按块消费 Arrow IPC 数据，避免在 FFI 边界一次性承载过大的结果集。
 
 ### 2. 分词主接口
 

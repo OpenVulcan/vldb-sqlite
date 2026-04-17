@@ -11,6 +11,17 @@
 - SQLite-oriented responses including `rows_changed` and `last_insert_rowid`
 - Flat scalar parameter binding via protobuf `oneof`, while legacy `params_json` remains accepted for compatibility
 
+## Dual-Mode SQL Parity
+
+`vldb-sqlite` now keeps **gRPC mode** and **library/FFI mode** aligned on the same shared SQL core:
+
+- gRPC mode still provides the full SQLite gateway surface
+- Rust typed API can call the same execution core directly
+- non-JSON FFI now covers `ExecuteScript`, `ExecuteBatch`, `QueryJson`, and `QueryStream`
+- JSON FFI remains available as a compatibility layer for scripting and lightweight hosts
+
+This means native hosts can now replace the old gRPC SQLite client path without losing generic SQL capability.
+
 ## Quick Start
 
 Build:
@@ -115,17 +126,22 @@ Default endpoint:
 - Go / 原生宿主主接口：
   - `vldb_sqlite_runtime_create_default()`
   - `vldb_sqlite_runtime_open_database()`
+  - `vldb_sqlite_database_execute_script()` / `vldb_sqlite_database_execute_batch()`
+  - `vldb_sqlite_database_query_json()` / `vldb_sqlite_database_query_stream()`
   - `vldb_sqlite_database_tokenize_text()`
   - `vldb_sqlite_database_upsert_custom_word()` / `vldb_sqlite_database_remove_custom_word()` / `vldb_sqlite_database_list_custom_words()`
   - `vldb_sqlite_database_ensure_fts_index()` / `vldb_sqlite_database_rebuild_fts_index()`
   - `vldb_sqlite_database_upsert_fts_document()` / `vldb_sqlite_database_delete_fts_document()` / `vldb_sqlite_database_search_fts()`
 - JSON 兼容层：
   - `vldb_sqlite_library_info_json()` 等基础 FFI 引导接口
+  - `vldb_sqlite_execute_script_json()` / `vldb_sqlite_execute_batch_json()`
+  - `vldb_sqlite_query_json_json()`
+  - `vldb_sqlite_query_stream_json()` / `vldb_sqlite_query_stream_chunk_json()` / `vldb_sqlite_query_stream_close_json()`
   - `vldb_sqlite_tokenize_text_json()`
   - `vldb_sqlite_upsert_custom_word_json()` / `vldb_sqlite_remove_custom_word_json()` / `vldb_sqlite_list_custom_words_json()`
   - `vldb_sqlite_ensure_fts_index_json()` / `vldb_sqlite_rebuild_fts_index_json()` / `vldb_sqlite_upsert_fts_document_json()` / `vldb_sqlite_delete_fts_document_json()` / `vldb_sqlite_search_fts_json()`
 
-当前已经提供 `_vulcan_dict` 伴生词典表、可选 `none/jieba` 分词能力、SQLite 连接级 `tokenize='jieba'` tokenizer 注册，以及最小闭环的 FTS 建表 / 重建 / 写入 / 删除 / 检索接口。词典热更新后，可通过 `RebuildFtsIndex` 使用当前词典重新写入既有文档索引，避免旧文档仍停留在旧分词结果。`SearchFts` 当前已返回 `id / file_path / title / title_highlight / content_snippet / score / rank / raw_score / source / query_mode`，后续仍会继续把结果结构和融合体验打磨到更适合 RRF 混合检索的状态。
+当前已经提供 `_vulcan_dict` 伴生词典表、可选 `none/jieba` 分词能力、SQLite 连接级 `tokenize='jieba'` tokenizer 注册，以及最小闭环的 FTS 建表 / 重建 / 写入 / 删除 / 检索接口。词典热更新后，可通过 `RebuildFtsIndex` 使用当前词典重新写入既有文档索引，避免旧文档仍停留在旧分词结果。`SearchFts` 当前已返回 `id / file_path / title / title_highlight / content_snippet / score / rank / raw_score / source / query_mode`，后续仍会继续把结果结构和融合体验打磨到更适合 RRF 混合检索的状态。对于 JSON 兼容层，`query_stream_json` 现在只返回流元信息与 `stream_id`；调用方需要继续使用 `query_stream_chunk_json` 逐块读取，并在完成后调用 `query_stream_close_json` 释放缓存结果。
 
 ### gRPC 与 lib 的边界
 

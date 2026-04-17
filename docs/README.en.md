@@ -15,6 +15,13 @@ Main project:
 - `QueryJson`: execute a lightweight query and return JSON directly
 - `QueryStream`: execute a single query and stream the result as Arrow IPC chunks
 
+The current version also aligns **generic SQL capability across gRPC mode and library/FFI mode**:
+
+- gRPC keeps the full SQLite gateway surface
+- lib / FFI now covers `ExecuteScript`, `ExecuteBatch`, `QueryJson`, and `QueryStream`
+- Rust typed API, non-JSON FFI, and JSON compatibility FFI all reuse the same shared SQL execution core
+- native hosts can now replace the old SQLite gRPC client path without losing generic SQL support
+
 Unlike `vldb-duckdb`, this service is tuned around SQLite semantics:
 
 - SQLite URI filenames are optional and gated by config

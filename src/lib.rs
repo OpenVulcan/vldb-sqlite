@@ -4,6 +4,7 @@ pub mod ffi;
 pub mod fts;
 pub mod library;
 pub mod runtime;
+pub mod sql_exec;
 pub mod tokenizer;
 
 /// 由库模式直接导出的 protobuf 模块。

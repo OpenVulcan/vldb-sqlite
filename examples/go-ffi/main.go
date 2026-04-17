@@ -51,6 +51,46 @@ func main() {
 
 	log.Printf("数据库路径 / database path: %s", dbPath)
 
+	executeResult, err := db.ExecuteScript(
+		"CREATE TABLE IF NOT EXISTS notes(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, body TEXT, score REAL)",
+		nil,
+		"",
+	)
+	if err != nil {
+		log.Fatalf("建表失败 / failed to create table: %v", err)
+	}
+	log.Printf("建表结果 / execute result: %+v", executeResult)
+
+	batchResult, err := db.ExecuteBatch(
+		"INSERT INTO notes(title, body, score) VALUES (?1, ?2, ?3)",
+		[][]sqliteffi.SQLValue{
+			{
+				{Kind: sqliteffi.SQLValueString, String: "第一条"},
+				{Kind: sqliteffi.SQLValueString, String: "市民田-女士急匆匆地赶往会议室"},
+				{Kind: sqliteffi.SQLValueFloat64, Float64: 7.5},
+			},
+			{
+				{Kind: sqliteffi.SQLValueString, String: "第二条"},
+				{Kind: sqliteffi.SQLValueString, String: "今天的议题围绕代码优化与交付效率展开"},
+				{Kind: sqliteffi.SQLValueFloat64, Float64: 9.5},
+			},
+		},
+	)
+	if err != nil {
+		log.Fatalf("批量写入失败 / failed to execute batch: %v", err)
+	}
+	log.Printf("批量执行结果 / batch result: %+v", batchResult)
+
+	queryJSONResult, err := db.QueryJSON(
+		"SELECT id, title, body, score FROM notes WHERE score >= ?1 ORDER BY id",
+		[]sqliteffi.SQLValue{{Kind: sqliteffi.SQLValueFloat64, Float64: 7.5}},
+		"",
+	)
+	if err != nil {
+		log.Fatalf("JSON 查询失败 / failed to execute query json: %v", err)
+	}
+	log.Printf("JSON 查询结果 / query json result: rows=%d payload=%s", queryJSONResult.RowCount, queryJSONResult.JSONData)
+
 	mutation, err := db.UpsertCustomWord("田-女士", 64)
 	if err != nil {
 		log.Fatalf("写入专有词失败 / failed to upsert custom word: %v", err)
@@ -107,5 +147,33 @@ func main() {
 			hit.TitleHighlight,
 			hit.ContentSnippet,
 		)
+	}
+
+	streamHandle, err := db.QueryStream(
+		"SELECT id, title, score FROM notes ORDER BY id",
+		nil,
+		"",
+		0,
+	)
+	if err != nil {
+		log.Fatalf("流式查询失败 / failed to execute query stream: %v", err)
+	}
+	defer func() {
+		if closeErr := streamHandle.Close(); closeErr != nil {
+			log.Printf("关闭流式查询句柄失败 / failed to close query stream handle: %v", closeErr)
+		}
+	}()
+	log.Printf(
+		"流式查询结果 / query stream result: rows=%d chunks=%d total_bytes=%d",
+		streamHandle.RowCount,
+		streamHandle.ChunkCount,
+		streamHandle.TotalBytes,
+	)
+	for i := uint64(0); i < streamHandle.ChunkCount; i++ {
+		chunk, chunkErr := streamHandle.ReadChunk(i)
+		if chunkErr != nil {
+			log.Fatalf("读取流式查询 chunk 失败 / failed to read query stream chunk: %v", chunkErr)
+		}
+		log.Printf("流式查询 chunk / query stream chunk: index=%d bytes=%d", i, len(chunk))
 	}
 }

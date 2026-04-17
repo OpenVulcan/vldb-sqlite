@@ -2,6 +2,12 @@
 
 This guide is for client-side integrators of `vldb-sqlite`. It explains how to connect to the gRPC service, how to bind parameters, and how to handle retryable SQLite errors correctly.
 
+Additional note: generic SQL execution is now implemented through a shared core module, which means:
+
+- gRPC remains the complete remote SQLite gateway
+- lib / FFI now also exposes `ExecuteScript`, `ExecuteBatch`, `QueryJson`, and `QueryStream`
+- both modes stay aligned on the same generic SQL semantics instead of drifting into separate implementations
+
 ## 0. Document Index
 
 - Chinese README: [./docs/README.zh-CN.md](./README.zh-CN.md)

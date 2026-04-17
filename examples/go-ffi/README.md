@@ -9,10 +9,14 @@
 - 加载 `vldb_sqlite.dll/.so/.dylib`
 - 创建 `SqliteRuntime`
 - 打开数据库句柄
+- 建表与普通 SQL 执行
+- 批量写入
+- JSON 查询
 - 写入自定义词
 - 建立 FTS 索引
 - 写入 FTS 文档
 - 执行 FTS 检索
+- Arrow IPC chunk 查询
 - 读取 `id / file_path / score / rank / raw_score`
 
 ## 运行前提
@@ -44,6 +48,14 @@ go run . /path/to/libvldb_sqlite.dylib
 ## 说明
 
 - 这个示例刻意使用 **非 JSON 主接口**
+- 示例现在同时演示：
+  - `ExecuteScript`
+  - `ExecuteBatch`
+  - `QueryJSON`
+  - `QueryStream` 句柄式渐进读取
+  - tokenizer + FTS
+- `QueryStream()` 现在返回流句柄，调用方可以按 chunk 逐块消费结果，而不是一次性把全部 chunk 聚合进内存
+- 如果调用方确实需要历史上的“全量聚合”行为，可显式使用 `CollectQueryStream()` 辅助接口
 - JSON 兼容层未作为主路径使用
 - 如果后续要给生产 Go 项目接入，建议把 `sqliteffi` 目录抽成独立内部包，再补：
   - 错误码枚举

@@ -15,6 +15,13 @@
 - `QueryJson`：执行轻量查询，并把结果直接转成 JSON 字符串返回
 - `QueryStream`：执行单条查询，并把结果以 Arrow IPC 字节流返回
 
+当前版本还新增了 **库模式与 gRPC 模式的通用 SQL 双态对齐**：
+
+- gRPC 继续保留完整 SQLite 网关能力
+- lib / FFI 已补齐 `ExecuteScript`、`ExecuteBatch`、`QueryJson`、`QueryStream`
+- Rust typed API、非 JSON FFI、JSON 兼容接口共同复用同一套 SQL 核心执行逻辑
+- 上层宿主现在可以不再依赖旧的 SQLite gRPC 客户端，也能完整覆盖通用 SQL 能力
+
 相对 `vldb-duckdb`，它更贴近 SQLite 自身特性：
 
 - 可选支持 SQLite URI filename，但必须通过配置显式开启

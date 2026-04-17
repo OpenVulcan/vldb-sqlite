@@ -30,6 +30,10 @@ pub fn library_info() -> VldbSqliteLibraryInfo {
             "runtime_create_default",
             "runtime_open_database",
             "runtime_close_database",
+            "database_execute_script",
+            "database_execute_batch",
+            "database_query_json",
+            "database_query_stream",
             "database_tokenize_text",
             "database_upsert_custom_word",
             "database_remove_custom_word",
@@ -48,6 +52,12 @@ pub fn library_info() -> VldbSqliteLibraryInfo {
             "upsert_fts_document_json",
             "delete_fts_document_json",
             "search_fts_json",
+            "execute_script_json",
+            "execute_batch_json",
+            "query_json_json",
+            "query_stream_json",
+            "query_stream_chunk_json",
+            "query_stream_close_json",
         ],
     }
 }

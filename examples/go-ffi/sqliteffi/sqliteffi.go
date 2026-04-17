@@ -129,6 +129,78 @@ type SearchResult struct {
 	Hits []SearchHit
 }
 
+// SQLValueKind 表示 SQL 参数值类型。
+// SQLValueKind represents the SQL parameter value kind.
+type SQLValueKind int32
+
+const (
+	// SQLValueNull 表示 null。
+	// SQLValueNull represents null.
+	SQLValueNull SQLValueKind = 0
+	// SQLValueInt64 表示 int64。
+	// SQLValueInt64 represents int64.
+	SQLValueInt64 SQLValueKind = 1
+	// SQLValueFloat64 表示 float64。
+	// SQLValueFloat64 represents float64.
+	SQLValueFloat64 SQLValueKind = 2
+	// SQLValueString 表示字符串。
+	// SQLValueString represents string.
+	SQLValueString SQLValueKind = 3
+	// SQLValueBytes 表示字节数组。
+	// SQLValueBytes represents byte array.
+	SQLValueBytes SQLValueKind = 4
+	// SQLValueBool 表示布尔值。
+	// SQLValueBool represents bool.
+	SQLValueBool SQLValueKind = 5
+)
+
+// SQLValue 表示单个 SQL 参数值。
+// SQLValue represents a single SQL parameter value.
+type SQLValue struct {
+	Kind    SQLValueKind
+	Int64   int64
+	Float64 float64
+	String  string
+	Bytes   []byte
+	Bool    bool
+}
+
+// ExecuteResult 表示 execute/execute_batch 的统一结果。
+// ExecuteResult represents the unified execute/execute_batch result.
+type ExecuteResult struct {
+	Success            bool
+	Message            string
+	RowsChanged        int64
+	LastInsertRowID    int64
+	StatementsExecuted int64
+}
+
+// QueryJSONResult 表示 JSON 查询结果。
+// QueryJSONResult represents the JSON-query result.
+type QueryJSONResult struct {
+	JSONData string
+	RowCount uint64
+}
+
+// QueryStreamResult 表示聚合后的 Arrow IPC chunk 查询结果。
+// QueryStreamResult represents the aggregated Arrow IPC chunk query result.
+type QueryStreamResult struct {
+	RowCount   uint64
+	ChunkCount uint64
+	TotalBytes uint64
+	Chunks     [][]byte
+}
+
+// QueryStreamHandle 表示可渐进读取的 Arrow IPC chunk 查询句柄。
+// QueryStreamHandle represents an Arrow IPC chunk query handle that supports incremental reads.
+type QueryStreamHandle struct {
+	lib        *Library
+	handle     unsafe.Pointer
+	RowCount   uint64
+	ChunkCount uint64
+	TotalBytes uint64
+}
+
 // Library 表示已加载的 vldb-sqlite 动态库。
 // Library represents a loaded vldb-sqlite dynamic library.
 type Library struct {
@@ -144,6 +216,24 @@ type Library struct {
 	runtimeCloseDatabase          func(unsafe.Pointer, *byte) uint8
 	databaseDestroy               func(unsafe.Pointer)
 	databaseDBPath                func(unsafe.Pointer) *byte
+	databaseExecuteScript         func(unsafe.Pointer, *byte, *ffiValue, uint64, *byte) unsafe.Pointer
+	databaseExecuteBatch          func(unsafe.Pointer, *byte, *ffiValueSlice, uint64) unsafe.Pointer
+	databaseQueryJSON             func(unsafe.Pointer, *byte, *ffiValue, uint64, *byte) unsafe.Pointer
+	databaseQueryStream           func(unsafe.Pointer, *byte, *ffiValue, uint64, *byte, uint64) unsafe.Pointer
+	executeResultDestroy          func(unsafe.Pointer)
+	executeResultSuccess          func(unsafe.Pointer) uint8
+	executeResultMessage          func(unsafe.Pointer) *byte
+	executeResultRowsChanged      func(unsafe.Pointer) int64
+	executeResultLastInsertRowID  func(unsafe.Pointer) int64
+	executeResultStatementsExec   func(unsafe.Pointer) int64
+	queryJSONResultDestroy        func(unsafe.Pointer)
+	queryJSONResultJSONData       func(unsafe.Pointer) *byte
+	queryJSONResultRowCount       func(unsafe.Pointer) uint64
+	queryStreamDestroy            func(unsafe.Pointer)
+	queryStreamChunkCount         func(unsafe.Pointer) uint64
+	queryStreamRowCount           func(unsafe.Pointer) uint64
+	queryStreamTotalBytes         func(unsafe.Pointer) uint64
+	queryStreamGetChunk           func(unsafe.Pointer, uint64) byteBuffer
 	databaseTokenizeText          func(unsafe.Pointer, TokenizerMode, *byte, uint8) unsafe.Pointer
 	tokenizeResultDestroy         func(unsafe.Pointer)
 	tokenizeResultNormalizedText  func(unsafe.Pointer) *byte
@@ -175,6 +265,7 @@ type Library struct {
 	searchResultGetScore          func(unsafe.Pointer, uint64) float64
 	searchResultGetRank           func(unsafe.Pointer, uint64) uint64
 	searchResultGetRawScore       func(unsafe.Pointer, uint64) float64
+	bytesFree                     func(byteBuffer)
 	stringFree                    func(*byte)
 	lastErrorMessage              func() *byte
 	clearLastError                func()
@@ -235,6 +326,39 @@ type ftsMutationResultPod struct {
 	AffectedRows uint64
 }
 
+// byteView 对应 C ABI 的输入字节视图。
+// byteView mirrors the C ABI input byte view.
+type byteView struct {
+	Data *byte
+	Len  uint64
+}
+
+// byteBuffer 对应 C ABI 的可释放字节缓冲区。
+// byteBuffer mirrors the C ABI releasable byte buffer.
+type byteBuffer struct {
+	Data *byte
+	Len  uint64
+	Cap  uint64
+}
+
+// ffiValue 对应 C ABI 的 SQL 参数值结构。
+// ffiValue mirrors the C ABI SQL parameter value structure.
+type ffiValue struct {
+	Kind         SQLValueKind
+	Int64Value   int64
+	Float64Value float64
+	StringValue  *byte
+	BytesValue   byteView
+	BoolValue    uint8
+}
+
+// ffiValueSlice 对应 C ABI 的 SQL 参数切片结构。
+// ffiValueSlice mirrors the C ABI SQL parameter-slice structure.
+type ffiValueSlice struct {
+	Values *ffiValue
+	Len    uint64
+}
+
 // Open 加载 vldb-sqlite 动态库并完成函数绑定。
 // Open loads the vldb-sqlite dynamic library and binds all required functions.
 func Open(path string) (*Library, error) {
@@ -254,6 +378,24 @@ func Open(path string) (*Library, error) {
 	bind(&lib.runtimeCloseDatabase, "vldb_sqlite_runtime_close_database")
 	bind(&lib.databaseDestroy, "vldb_sqlite_database_destroy")
 	bind(&lib.databaseDBPath, "vldb_sqlite_database_db_path")
+	bind(&lib.databaseExecuteScript, "vldb_sqlite_database_execute_script")
+	bind(&lib.databaseExecuteBatch, "vldb_sqlite_database_execute_batch")
+	bind(&lib.databaseQueryJSON, "vldb_sqlite_database_query_json")
+	bind(&lib.databaseQueryStream, "vldb_sqlite_database_query_stream")
+	bind(&lib.executeResultDestroy, "vldb_sqlite_execute_result_destroy")
+	bind(&lib.executeResultSuccess, "vldb_sqlite_execute_result_success")
+	bind(&lib.executeResultMessage, "vldb_sqlite_execute_result_message")
+	bind(&lib.executeResultRowsChanged, "vldb_sqlite_execute_result_rows_changed")
+	bind(&lib.executeResultLastInsertRowID, "vldb_sqlite_execute_result_last_insert_rowid")
+	bind(&lib.executeResultStatementsExec, "vldb_sqlite_execute_result_statements_executed")
+	bind(&lib.queryJSONResultDestroy, "vldb_sqlite_query_json_result_destroy")
+	bind(&lib.queryJSONResultJSONData, "vldb_sqlite_query_json_result_json_data")
+	bind(&lib.queryJSONResultRowCount, "vldb_sqlite_query_json_result_row_count")
+	bind(&lib.queryStreamDestroy, "vldb_sqlite_query_stream_destroy")
+	bind(&lib.queryStreamChunkCount, "vldb_sqlite_query_stream_chunk_count")
+	bind(&lib.queryStreamRowCount, "vldb_sqlite_query_stream_row_count")
+	bind(&lib.queryStreamTotalBytes, "vldb_sqlite_query_stream_total_bytes")
+	bind(&lib.queryStreamGetChunk, "vldb_sqlite_query_stream_get_chunk")
 	bind(&lib.databaseTokenizeText, "vldb_sqlite_database_tokenize_text")
 	bind(&lib.tokenizeResultDestroy, "vldb_sqlite_tokenize_result_destroy")
 	bind(&lib.tokenizeResultNormalizedText, "vldb_sqlite_tokenize_result_normalized_text")
@@ -285,6 +427,7 @@ func Open(path string) (*Library, error) {
 	bind(&lib.searchResultGetScore, "vldb_sqlite_search_result_get_score")
 	bind(&lib.searchResultGetRank, "vldb_sqlite_search_result_get_rank")
 	bind(&lib.searchResultGetRawScore, "vldb_sqlite_search_result_get_raw_score")
+	bind(&lib.bytesFree, "vldb_sqlite_bytes_free")
 	bind(&lib.stringFree, "vldb_sqlite_string_free")
 	bind(&lib.lastErrorMessage, "vldb_sqlite_last_error_message")
 	bind(&lib.clearLastError, "vldb_sqlite_clear_last_error")
@@ -374,6 +517,175 @@ func (db *Database) DBPath() (string, error) {
 	return db.lib.takeOwnedString(func() *byte {
 		return db.lib.databaseDBPath(db.handle)
 	})
+}
+
+// ExecuteScript 通过数据库句柄执行脚本或单条 SQL。
+// ExecuteScript executes a script or a single SQL statement through the database handle.
+func (db *Database) ExecuteScript(sql string, params []SQLValue, paramsJSON string) (ExecuteResult, error) {
+	sqlPtr, keepSQL := makeCString(sql)
+	defer keepSQL()
+	values, keepValues, err := buildFFIValues(params)
+	if err != nil {
+		return ExecuteResult{}, err
+	}
+	defer keepValues()
+	paramsJSONPtr, keepParamsJSON := nullableCString(paramsJSON)
+	defer keepParamsJSON()
+	resultHandle := db.lib.databaseExecuteScript(db.handle, sqlPtr, values.ptr(), uint64(len(values.values)), paramsJSONPtr)
+	if resultHandle == nil {
+		return ExecuteResult{}, db.lib.lastError()
+	}
+	defer db.lib.executeResultDestroy(resultHandle)
+	return db.lib.readExecuteResult(resultHandle)
+}
+
+// ExecuteBatch 通过数据库句柄执行批量 SQL。
+// ExecuteBatch executes batch SQL through the database handle.
+func (db *Database) ExecuteBatch(sql string, items [][]SQLValue) (ExecuteResult, error) {
+	sqlPtr, keepSQL := makeCString(sql)
+	defer keepSQL()
+	slices, keepSlices, err := buildFFIValueMatrix(items)
+	if err != nil {
+		return ExecuteResult{}, err
+	}
+	defer keepSlices()
+	resultHandle := db.lib.databaseExecuteBatch(db.handle, sqlPtr, slices.ptr(), uint64(len(slices.slices)))
+	if resultHandle == nil {
+		return ExecuteResult{}, db.lib.lastError()
+	}
+	defer db.lib.executeResultDestroy(resultHandle)
+	return db.lib.readExecuteResult(resultHandle)
+}
+
+// QueryJSON 通过数据库句柄执行 JSON 查询。
+// QueryJSON executes a JSON query through the database handle.
+func (db *Database) QueryJSON(sql string, params []SQLValue, paramsJSON string) (QueryJSONResult, error) {
+	sqlPtr, keepSQL := makeCString(sql)
+	defer keepSQL()
+	values, keepValues, err := buildFFIValues(params)
+	if err != nil {
+		return QueryJSONResult{}, err
+	}
+	defer keepValues()
+	paramsJSONPtr, keepParamsJSON := nullableCString(paramsJSON)
+	defer keepParamsJSON()
+	resultHandle := db.lib.databaseQueryJSON(db.handle, sqlPtr, values.ptr(), uint64(len(values.values)), paramsJSONPtr)
+	if resultHandle == nil {
+		return QueryJSONResult{}, db.lib.lastError()
+	}
+	defer db.lib.queryJSONResultDestroy(resultHandle)
+	jsonData, err := db.lib.takeOwnedString(func() *byte {
+		return db.lib.queryJSONResultJSONData(resultHandle)
+	})
+	if err != nil {
+		return QueryJSONResult{}, err
+	}
+	return QueryJSONResult{
+		JSONData: jsonData,
+		RowCount: db.lib.queryJSONResultRowCount(resultHandle),
+	}, nil
+}
+
+// QueryStream 通过数据库句柄执行 Arrow IPC chunk 查询，并返回渐进读取句柄。
+// QueryStream executes an Arrow IPC chunk query through the database handle and returns an incremental-read handle.
+func (db *Database) QueryStream(sql string, params []SQLValue, paramsJSON string, chunkBytes uint64) (*QueryStreamHandle, error) {
+	sqlPtr, keepSQL := makeCString(sql)
+	defer keepSQL()
+	values, keepValues, err := buildFFIValues(params)
+	if err != nil {
+		return nil, err
+	}
+	defer keepValues()
+	paramsJSONPtr, keepParamsJSON := nullableCString(paramsJSON)
+	defer keepParamsJSON()
+	resultHandle := db.lib.databaseQueryStream(db.handle, sqlPtr, values.ptr(), uint64(len(values.values)), paramsJSONPtr, chunkBytes)
+	if resultHandle == nil {
+		return nil, db.lib.lastError()
+	}
+	stream := &QueryStreamHandle{
+		lib:        db.lib,
+		handle:     resultHandle,
+		RowCount:   db.lib.queryStreamRowCount(resultHandle),
+		ChunkCount: db.lib.queryStreamChunkCount(resultHandle),
+		TotalBytes: db.lib.queryStreamTotalBytes(resultHandle),
+	}
+	runtime.SetFinalizer(stream, func(handle *QueryStreamHandle) {
+		_ = handle.Close()
+	})
+	return stream, nil
+}
+
+// CollectQueryStream 执行流式查询并一次性聚合所有 chunk。
+// CollectQueryStream executes a streaming query and aggregates all chunks into memory.
+func (db *Database) CollectQueryStream(sql string, params []SQLValue, paramsJSON string, chunkBytes uint64) (QueryStreamResult, error) {
+	stream, err := db.QueryStream(sql, params, paramsJSON, chunkBytes)
+	if err != nil {
+		return QueryStreamResult{}, err
+	}
+	defer func() {
+		_ = stream.Close()
+	}()
+
+	chunks, err := stream.CollectAll()
+	if err != nil {
+		return QueryStreamResult{}, err
+	}
+
+	return QueryStreamResult{
+		RowCount:   stream.RowCount,
+		ChunkCount: stream.ChunkCount,
+		TotalBytes: stream.TotalBytes,
+		Chunks:     chunks,
+	}, nil
+}
+
+// ReadChunk 读取指定下标的 Arrow IPC chunk。
+// ReadChunk reads the Arrow IPC chunk at the specified index.
+func (stream *QueryStreamHandle) ReadChunk(index uint64) ([]byte, error) {
+	if stream == nil || stream.handle == nil {
+		return nil, errors.New("query stream handle is nil / QueryStream 句柄为空")
+	}
+	buffer := stream.lib.queryStreamGetChunk(stream.handle, index)
+	if buffer.Data == nil && buffer.Len > 0 {
+		return nil, stream.lib.lastError()
+	}
+	if buffer.Data == nil {
+		return []byte{}, nil
+	}
+	defer stream.lib.bytesFree(buffer)
+
+	chunk := make([]byte, int(buffer.Len))
+	copy(chunk, unsafe.Slice(buffer.Data, int(buffer.Len)))
+	return chunk, nil
+}
+
+// CollectAll 逐块读取当前 QueryStream 的全部 chunk。
+// CollectAll reads all chunks from the current QueryStream incrementally.
+func (stream *QueryStreamHandle) CollectAll() ([][]byte, error) {
+	if stream == nil || stream.handle == nil {
+		return nil, errors.New("query stream handle is nil / QueryStream 句柄为空")
+	}
+	chunks := make([][]byte, 0, stream.ChunkCount)
+	for i := uint64(0); i < stream.ChunkCount; i++ {
+		chunk, err := stream.ReadChunk(i)
+		if err != nil {
+			return nil, err
+		}
+		chunks = append(chunks, chunk)
+	}
+	return chunks, nil
+}
+
+// Close 释放底层 QueryStream 句柄。
+// Close releases the underlying QueryStream handle.
+func (stream *QueryStreamHandle) Close() error {
+	if stream == nil || stream.handle == nil {
+		return nil
+	}
+	stream.lib.queryStreamDestroy(stream.handle)
+	stream.handle = nil
+	runtime.SetFinalizer(stream, nil)
+	return nil
 }
 
 // Tokenize 通过数据库句柄执行分词。
@@ -655,6 +967,136 @@ type CustomWordEntry struct {
 	// Weight 表示词权重。
 	// Weight is the custom-word weight.
 	Weight uint64
+}
+
+type ffiValueArray struct {
+	values        []ffiValue
+	stringKeepers [][]byte
+	bytesKeepers  [][]byte
+}
+
+func (array *ffiValueArray) ptr() *ffiValue {
+	if array == nil || len(array.values) == 0 {
+		return nil
+	}
+	return &array.values[0]
+}
+
+func (array *ffiValueArray) keepAlive() {
+	if array == nil {
+		return
+	}
+	runtime.KeepAlive(array.values)
+	for _, keeper := range array.stringKeepers {
+		runtime.KeepAlive(keeper)
+	}
+	for _, keeper := range array.bytesKeepers {
+		runtime.KeepAlive(keeper)
+	}
+}
+
+type ffiValueMatrix struct {
+	slices []ffiValueSlice
+	rows   []ffiValueArray
+}
+
+func (matrix *ffiValueMatrix) ptr() *ffiValueSlice {
+	if matrix == nil || len(matrix.slices) == 0 {
+		return nil
+	}
+	return &matrix.slices[0]
+}
+
+func (matrix *ffiValueMatrix) keepAlive() {
+	if matrix == nil {
+		return
+	}
+	runtime.KeepAlive(matrix.slices)
+	for i := range matrix.rows {
+		matrix.rows[i].keepAlive()
+	}
+}
+
+func buildFFIValues(values []SQLValue) (ffiValueArray, func(), error) {
+	if len(values) == 0 {
+		return ffiValueArray{}, func() {}, nil
+	}
+
+	array := ffiValueArray{
+		values: make([]ffiValue, len(values)),
+	}
+	for index, value := range values {
+		array.values[index].Kind = value.Kind
+		switch value.Kind {
+		case SQLValueNull:
+		case SQLValueInt64:
+			array.values[index].Int64Value = value.Int64
+		case SQLValueFloat64:
+			array.values[index].Float64Value = value.Float64
+		case SQLValueString:
+			buffer := append([]byte(value.String), 0)
+			array.stringKeepers = append(array.stringKeepers, buffer)
+			array.values[index].StringValue = &buffer[0]
+		case SQLValueBytes:
+			if len(value.Bytes) > 0 {
+				buffer := append([]byte(nil), value.Bytes...)
+				array.bytesKeepers = append(array.bytesKeepers, buffer)
+				array.values[index].BytesValue = byteView{Data: &buffer[0], Len: uint64(len(buffer))}
+			}
+		case SQLValueBool:
+			array.values[index].BoolValue = boolToUint8(value.Bool)
+		default:
+			return ffiValueArray{}, nil, fmt.Errorf("unsupported SQL value kind / 不支持的 SQL 参数类型: %d", value.Kind)
+		}
+	}
+
+	return array, func() { array.keepAlive() }, nil
+}
+
+func buildFFIValueMatrix(items [][]SQLValue) (ffiValueMatrix, func(), error) {
+	if len(items) == 0 {
+		return ffiValueMatrix{}, func() {}, nil
+	}
+
+	matrix := ffiValueMatrix{
+		slices: make([]ffiValueSlice, len(items)),
+		rows:   make([]ffiValueArray, len(items)),
+	}
+	for index, item := range items {
+		row, _, err := buildFFIValues(item)
+		if err != nil {
+			return ffiValueMatrix{}, nil, err
+		}
+		matrix.rows[index] = row
+		matrix.slices[index] = ffiValueSlice{
+			Values: row.ptr(),
+			Len:    uint64(len(row.values)),
+		}
+	}
+	return matrix, func() { matrix.keepAlive() }, nil
+}
+
+func nullableCString(value string) (*byte, func()) {
+	if value == "" {
+		return nil, func() {}
+	}
+	return makeCString(value)
+}
+
+func (lib *Library) readExecuteResult(handle unsafe.Pointer) (ExecuteResult, error) {
+	message, err := lib.takeOwnedString(func() *byte {
+		return lib.executeResultMessage(handle)
+	})
+	if err != nil {
+		return ExecuteResult{}, err
+	}
+	return ExecuteResult{
+		Success:            lib.executeResultSuccess(handle) != 0,
+		Message:            message,
+		RowsChanged:        lib.executeResultRowsChanged(handle),
+		LastInsertRowID:    lib.executeResultLastInsertRowID(handle),
+		StatementsExecuted: lib.executeResultStatementsExec(handle),
+	}, nil
 }
 
 // takeOwnedString 调用返回 char* 的函数并自动释放返回值。

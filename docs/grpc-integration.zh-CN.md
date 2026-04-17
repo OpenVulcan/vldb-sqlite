@@ -2,6 +2,12 @@
 
 本文面向 `vldb-sqlite` 的客户端接入方，重点说明如何通过 gRPC 调用 SQLite 微服务、如何绑定参数、以及如何处理可重试错误。
 
+补充说明：当前仓库已经把通用 SQL 核心下沉为共享模块，因此：
+
+- gRPC 仍然是完整的远程 SQLite 网关
+- lib / FFI 也已经补齐 `ExecuteScript`、`ExecuteBatch`、`QueryJson`、`QueryStream`
+- 两条形态在通用 SQL 语义上尽量保持一致，避免长期维护两套漂移实现
+
 ## 0. 文档索引
 
 - 中文说明: [./docs/README.zh-CN.md](./README.zh-CN.md)

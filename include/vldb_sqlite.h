@@ -56,6 +56,24 @@ typedef struct VldbSqliteCustomWordListHandle VldbSqliteCustomWordListHandle;
 typedef struct VldbSqliteSearchResultHandle VldbSqliteSearchResultHandle;
 
 /*
+ * 通用 SQL 执行结果句柄前置声明。
+ * Forward declaration of the shared SQL execution-result handle.
+ */
+typedef struct VldbSqliteExecuteResultHandle VldbSqliteExecuteResultHandle;
+
+/*
+ * JSON 查询结果句柄前置声明。
+ * Forward declaration of the JSON-query result handle.
+ */
+typedef struct VldbSqliteQueryJsonResultHandle VldbSqliteQueryJsonResultHandle;
+
+/*
+ * Arrow IPC chunk 查询结果句柄前置声明。
+ * Forward declaration of the Arrow IPC chunk query-result handle.
+ */
+typedef struct VldbSqliteQueryStreamHandle VldbSqliteQueryStreamHandle;
+
+/*
  * 自定义词修改结果结构。
  * Custom-word mutation result structure.
  */
@@ -91,6 +109,60 @@ typedef struct VldbSqliteFtsMutationResultPod {
     uint8_t success;
     uint64_t affected_rows;
 } VldbSqliteFtsMutationResultPod;
+
+/*
+ * 字节视图结构，供 FFI 输入 bytes 参数使用。
+ * Byte-view structure used for FFI input bytes parameters.
+ */
+typedef struct VldbSqliteByteView {
+    const uint8_t* data;
+    uint64_t len;
+} VldbSqliteByteView;
+
+/*
+ * 可释放字节缓冲区结构，供 QueryStream chunk getter 返回。
+ * Releasable byte-buffer structure returned by QueryStream chunk getters.
+ */
+typedef struct VldbSqliteByteBuffer {
+    uint8_t* data;
+    uint64_t len;
+    uint64_t cap;
+} VldbSqliteByteBuffer;
+
+/*
+ * FFI SQL 值类型枚举。
+ * FFI SQL value-kind enum.
+ */
+typedef enum VldbSqliteFfiValueKind {
+    VLDB_SQLITE_VALUE_NULL = 0,
+    VLDB_SQLITE_VALUE_INT64 = 1,
+    VLDB_SQLITE_VALUE_FLOAT64 = 2,
+    VLDB_SQLITE_VALUE_STRING = 3,
+    VLDB_SQLITE_VALUE_BYTES = 4,
+    VLDB_SQLITE_VALUE_BOOL = 5
+} VldbSqliteFfiValueKind;
+
+/*
+ * FFI SQL 参数值结构。
+ * FFI SQL parameter value structure.
+ */
+typedef struct VldbSqliteFfiValue {
+    VldbSqliteFfiValueKind kind;
+    int64_t int64_value;
+    double float64_value;
+    const char* string_value;
+    VldbSqliteByteView bytes_value;
+    uint8_t bool_value;
+} VldbSqliteFfiValue;
+
+/*
+ * FFI SQL 参数切片结构。
+ * FFI SQL parameter-slice structure.
+ */
+typedef struct VldbSqliteFfiValueSlice {
+    const VldbSqliteFfiValue* values;
+    uint64_t len;
+} VldbSqliteFfiValueSlice;
 
 /*
  * 返回 `vldb-sqlite` 当前库模式元信息 JSON。
@@ -147,6 +219,12 @@ char* vldb_sqlite_database_db_path(VldbSqliteDatabaseHandle* handle);
 void vldb_sqlite_string_free(char* value);
 
 /*
+ * 释放由 QueryStream chunk getter 返回的字节缓冲区。
+ * Free a byte buffer returned by a QueryStream chunk getter.
+ */
+void vldb_sqlite_bytes_free(VldbSqliteByteBuffer buffer);
+
+/*
  * 获取最近一次 FFI 错误消息；返回指针在下一次错误更新或 clear 后失效。
  * Return the latest FFI error message; the pointer becomes invalid after the next error update or clear.
  */
@@ -163,6 +241,141 @@ void vldb_sqlite_clear_last_error(void);
  * Return whether the JSON pointer is null.
  */
 uint8_t vldb_sqlite_json_is_null(const char* value);
+
+/*
+ * 通过数据库句柄执行脚本或单条 SQL。
+ * Execute a script or a single SQL statement through a database handle.
+ */
+VldbSqliteExecuteResultHandle* vldb_sqlite_database_execute_script(
+    VldbSqliteDatabaseHandle* handle,
+    const char* sql,
+    const VldbSqliteFfiValue* params,
+    uint64_t params_len,
+    const char* params_json
+);
+
+/*
+ * 通过数据库句柄执行批量 SQL。
+ * Execute batch SQL through a database handle.
+ */
+VldbSqliteExecuteResultHandle* vldb_sqlite_database_execute_batch(
+    VldbSqliteDatabaseHandle* handle,
+    const char* sql,
+    const VldbSqliteFfiValueSlice* items,
+    uint64_t items_len
+);
+
+/*
+ * 通过数据库句柄执行 JSON 查询。
+ * Execute a JSON query through a database handle.
+ */
+VldbSqliteQueryJsonResultHandle* vldb_sqlite_database_query_json(
+    VldbSqliteDatabaseHandle* handle,
+    const char* sql,
+    const VldbSqliteFfiValue* params,
+    uint64_t params_len,
+    const char* params_json
+);
+
+/*
+ * 通过数据库句柄执行 Arrow IPC chunk 查询。
+ * Execute an Arrow IPC chunk query through a database handle.
+ */
+VldbSqliteQueryStreamHandle* vldb_sqlite_database_query_stream(
+    VldbSqliteDatabaseHandle* handle,
+    const char* sql,
+    const VldbSqliteFfiValue* params,
+    uint64_t params_len,
+    const char* params_json,
+    uint64_t chunk_bytes
+);
+
+/*
+ * 释放通用 SQL 执行结果句柄。
+ * Destroy a shared SQL execution-result handle.
+ */
+void vldb_sqlite_execute_result_destroy(VldbSqliteExecuteResultHandle* handle);
+
+/*
+ * 返回通用 SQL 执行结果中的 success 标志。
+ * Return the success flag from a shared SQL execution result.
+ */
+uint8_t vldb_sqlite_execute_result_success(VldbSqliteExecuteResultHandle* handle);
+
+/*
+ * 返回通用 SQL 执行结果中的 message。
+ * Return the message from a shared SQL execution result.
+ */
+char* vldb_sqlite_execute_result_message(VldbSqliteExecuteResultHandle* handle);
+
+/*
+ * 返回通用 SQL 执行结果中的 rows_changed。
+ * Return rows_changed from a shared SQL execution result.
+ */
+int64_t vldb_sqlite_execute_result_rows_changed(VldbSqliteExecuteResultHandle* handle);
+
+/*
+ * 返回通用 SQL 执行结果中的 last_insert_rowid。
+ * Return last_insert_rowid from a shared SQL execution result.
+ */
+int64_t vldb_sqlite_execute_result_last_insert_rowid(VldbSqliteExecuteResultHandle* handle);
+
+/*
+ * 返回通用 SQL 执行结果中的 statements_executed。
+ * Return statements_executed from a shared SQL execution result.
+ */
+int64_t vldb_sqlite_execute_result_statements_executed(VldbSqliteExecuteResultHandle* handle);
+
+/*
+ * 释放 JSON 查询结果句柄。
+ * Destroy a JSON-query result handle.
+ */
+void vldb_sqlite_query_json_result_destroy(VldbSqliteQueryJsonResultHandle* handle);
+
+/*
+ * 返回 JSON 查询结果中的 JSON 行集字符串。
+ * Return the JSON row-set string from a JSON-query result.
+ */
+char* vldb_sqlite_query_json_result_json_data(VldbSqliteQueryJsonResultHandle* handle);
+
+/*
+ * 返回 JSON 查询结果中的行数。
+ * Return the row count from a JSON-query result.
+ */
+uint64_t vldb_sqlite_query_json_result_row_count(VldbSqliteQueryJsonResultHandle* handle);
+
+/*
+ * 释放 Arrow IPC chunk 查询结果句柄。
+ * Destroy an Arrow IPC chunk query-result handle.
+ */
+void vldb_sqlite_query_stream_destroy(VldbSqliteQueryStreamHandle* handle);
+
+/*
+ * 返回 Arrow IPC chunk 数量。
+ * Return the number of Arrow IPC chunks.
+ */
+uint64_t vldb_sqlite_query_stream_chunk_count(VldbSqliteQueryStreamHandle* handle);
+
+/*
+ * 返回 Arrow IPC chunk 查询结果中的行数。
+ * Return the row count from an Arrow IPC chunk query result.
+ */
+uint64_t vldb_sqlite_query_stream_row_count(VldbSqliteQueryStreamHandle* handle);
+
+/*
+ * 返回 Arrow IPC chunk 查询结果的总字节数。
+ * Return the total byte count from an Arrow IPC chunk query result.
+ */
+uint64_t vldb_sqlite_query_stream_total_bytes(VldbSqliteQueryStreamHandle* handle);
+
+/*
+ * 返回指定下标的 Arrow IPC chunk。
+ * Return the Arrow IPC chunk at the specified index.
+ */
+VldbSqliteByteBuffer vldb_sqlite_query_stream_get_chunk(
+    VldbSqliteQueryStreamHandle* handle,
+    uint64_t index
+);
 
 /*
  * 通过数据库句柄执行分词主接口，返回结果句柄。
@@ -417,6 +630,42 @@ double vldb_sqlite_search_result_get_raw_score(
     VldbSqliteSearchResultHandle* handle,
     uint64_t index
 );
+
+/*
+ * 通过 JSON 请求执行脚本或单条 SQL。
+ * Execute a script or a single SQL statement from a JSON request.
+ */
+char* vldb_sqlite_execute_script_json(const char* request_json);
+
+/*
+ * 通过 JSON 请求执行批量 SQL。
+ * Execute batch SQL from a JSON request.
+ */
+char* vldb_sqlite_execute_batch_json(const char* request_json);
+
+/*
+ * 通过 JSON 请求执行 JSON 查询。
+ * Execute a JSON query from a JSON request.
+ */
+char* vldb_sqlite_query_json_json(const char* request_json);
+
+/*
+ * 通过 JSON 请求执行 Arrow IPC chunk 查询。
+ * Execute an Arrow IPC chunk query from a JSON request.
+ */
+char* vldb_sqlite_query_stream_json(const char* request_json);
+
+/*
+ * 通过 JSON 请求读取指定 QueryStream 句柄中的单个 chunk。
+ * Read a single chunk from a JSON QueryStream handle.
+ */
+char* vldb_sqlite_query_stream_chunk_json(const char* request_json);
+
+/*
+ * 通过 JSON 请求关闭 QueryStream 句柄并释放缓存结果。
+ * Close a JSON QueryStream handle and release cached results.
+ */
+char* vldb_sqlite_query_stream_close_json(const char* request_json);
 
 /*
  * 通过 JSON 请求执行分词；请求和响应都使用 UTF-8 JSON 字符串。
