@@ -109,8 +109,8 @@ pub struct VldbSqliteQueryJsonResultHandle {
 /// FFI Arrow IPC chunk 查询结果句柄。
 /// FFI Arrow IPC chunk query-result handle.
 pub struct VldbSqliteQueryStreamHandle {
-    /// 内部 Arrow IPC chunk 查询结果。
-    /// Internal Arrow IPC chunk query result.
+    /// 内部 Arrow IPC chunk 查询结果句柄。
+    /// Internal Arrow IPC chunk query-result handle.
     inner: QueryStreamResult,
 }
 
@@ -1408,13 +1408,12 @@ pub extern "C" fn vldb_sqlite_query_stream_get_chunk(
         let handle = query_stream_handle_ref(handle)?;
         let chunk = handle
             .inner
-            .chunks
-            .get(
+            .read_chunk(
                 usize::try_from(index)
                     .map_err(|_| "chunk index exceeds usize / chunk 下标超过 usize".to_string())?,
             )
-            .ok_or_else(|| "chunk index out of bounds / chunk 下标越界".to_string())?;
-        Ok(bytes_to_buffer(chunk))
+            .map_err(sql_exec_error_to_string)?;
+        Ok(bytes_to_buffer(&chunk))
     })() {
         Ok(buffer) => buffer,
         Err(error) => {
@@ -2415,12 +2414,11 @@ pub extern "C" fn vldb_sqlite_query_stream_chunk_json(request_json: *const c_cha
             .map_err(|error| format!("failed to parse query_stream_chunk request JSON: {error}"))?;
         let response = with_json_query_stream(request.stream_id, |result| {
             let chunk = result
-                .chunks
-                .get(
+                .read_chunk(
                     usize::try_from(request.index)
                         .map_err(|_| "chunk index exceeds usize / chunk 下标超过 usize".to_string())?,
                 )
-                .ok_or_else(|| format!("chunk index out of bounds: {} / chunk 下标越界", request.index))?;
+                .map_err(sql_exec_error_to_string)?;
             Ok(FfiQueryStreamChunkJsonResponse {
                 success: true,
                 message: format!(

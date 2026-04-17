@@ -9,7 +9,11 @@ use rusqlite::{Connection, Error as RusqliteError};
 use serde::Serialize;
 use serde_json::{Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::fmt;
+use std::fs::File;
 use std::io::{self, Write};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// 默认 Arrow IPC chunk 大小，供流式查询在内存与下游消费之间折中。
@@ -73,12 +77,12 @@ pub struct QueryJsonResult {
 
 /// Arrow IPC chunk 查询结果。
 /// Arrow IPC chunk query result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 #[allow(dead_code)]
 pub struct QueryStreamResult {
-    /// Arrow IPC chunk 列表。
-    /// Arrow IPC chunks.
-    pub chunks: Vec<Vec<u8>>,
+    /// 临时文件后端与 chunk 索引。
+    /// Temporary-file backend and chunk index metadata.
+    storage: QueryStreamStorage,
     /// 返回行数。
     /// Number of rows returned.
     pub row_count: u64,
@@ -88,6 +92,79 @@ pub struct QueryStreamResult {
     /// 总字节数。
     /// Total byte size of all chunks.
     pub total_bytes: u64,
+}
+
+/// QueryStream 单个 chunk 的文件偏移与长度信息。
+/// File offset and length metadata for a single QueryStream chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueryStreamChunkDescriptor {
+    /// chunk 在暂存文件中的起始偏移。
+    /// Starting offset of the chunk in the spool file.
+    offset: u64,
+    /// chunk 的字节长度。
+    /// Byte length of the chunk.
+    len: u64,
+}
+
+/// QueryStream 暂存后端。
+/// QueryStream spool backend.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct QueryStreamStorage {
+    /// 暂存文件路径。
+    /// Spool file path.
+    file_path: PathBuf,
+    /// chunk 偏移索引。
+    /// Chunk offset index.
+    chunks: Vec<QueryStreamChunkDescriptor>,
+}
+
+#[allow(dead_code)]
+impl QueryStreamResult {
+    /// 读取指定下标的 chunk 内容。
+    /// Read the chunk content at the specified index.
+    pub fn read_chunk(&self, index: usize) -> Result<Vec<u8>, SqlExecCoreError> {
+        let descriptor = self.chunks_descriptor(index)?;
+        let mut file = File::open(&self.storage.file_path).map_err(|error| {
+            SqlExecCoreError::Internal(format!(
+                "open query stream spool file failed: {error}"
+            ))
+        })?;
+        file.seek(SeekFrom::Start(descriptor.offset)).map_err(|error| {
+            SqlExecCoreError::Internal(format!(
+                "seek query stream spool file failed: {error}"
+            ))
+        })?;
+        let chunk_len = usize::try_from(descriptor.len).map_err(|_| {
+            SqlExecCoreError::Internal(
+                "query stream chunk length exceeds usize / QueryStream chunk 长度超过 usize"
+                    .to_string(),
+            )
+        })?;
+        let mut chunk = vec![0_u8; chunk_len];
+        file.read_exact(&mut chunk).map_err(|error| {
+            SqlExecCoreError::Internal(format!(
+                "read query stream spool chunk failed: {error}"
+            ))
+        })?;
+        Ok(chunk)
+    }
+
+    /// 返回指定下标的 chunk 描述信息。
+    /// Return the chunk descriptor at the specified index.
+    fn chunks_descriptor(&self, index: usize) -> Result<QueryStreamChunkDescriptor, SqlExecCoreError> {
+        self.storage.chunks.get(index).copied().ok_or_else(|| {
+            SqlExecCoreError::InvalidArgument(
+                "chunk index out of bounds / chunk 下标越界".to_string(),
+            )
+        })
+    }
+}
+
+impl Drop for QueryStreamResult {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.storage.file_path);
+    }
 }
 
 /// QueryStream 执行过程中的共享统计信息。
@@ -444,11 +521,11 @@ pub fn query_stream(
     bound_values: &[SqliteValue],
     target_chunk_size: usize,
 ) -> Result<QueryStreamResult, SqlExecCoreError> {
-    let collector = ChunkCollector::new(target_chunk_size);
-    let (collector, metrics) = query_stream_with_writer(conn, sql, bound_values, collector)?;
+    let writer = TempFileChunkWriter::new(target_chunk_size)?;
+    let (writer, metrics) = query_stream_with_writer(conn, sql, bound_values, writer)?;
 
     Ok(QueryStreamResult {
-        chunks: collector.chunks,
+        storage: writer.into_storage(),
         row_count: metrics.row_count,
         chunk_count: metrics.chunk_count,
         total_bytes: metrics.total_bytes,
@@ -961,6 +1038,119 @@ impl ChunkCollector {
     }
 }
 
+/// 基于临时文件的 QueryStream chunk 写入器。
+/// Temporary-file-backed QueryStream chunk writer.
+pub struct TempFileChunkWriter {
+    file: File,
+    file_path: PathBuf,
+    pending: Vec<u8>,
+    target_chunk_size: usize,
+    emitted_chunks: usize,
+    emitted_bytes: usize,
+    current_offset: u64,
+    chunk_descriptors: Vec<QueryStreamChunkDescriptor>,
+}
+
+static NEXT_QUERY_STREAM_SPOOL_ID: AtomicU64 = AtomicU64::new(1);
+
+impl TempFileChunkWriter {
+    fn new(target_chunk_size: usize) -> Result<Self, SqlExecCoreError> {
+        let chunk_size = target_chunk_size.max(64 * 1024);
+        let file_path = make_query_stream_spool_path();
+        let file = File::create(&file_path).map_err(|error| {
+            SqlExecCoreError::Internal(format!(
+                "create query stream spool file failed: {error}"
+            ))
+        })?;
+        Ok(Self {
+            file,
+            file_path,
+            pending: Vec::with_capacity(chunk_size),
+            target_chunk_size: chunk_size,
+            emitted_chunks: 0,
+            emitted_bytes: 0,
+            current_offset: 0,
+            chunk_descriptors: Vec::new(),
+        })
+    }
+
+    fn into_storage(self) -> QueryStreamStorage {
+        QueryStreamStorage {
+            file_path: self.file_path,
+            chunks: self.chunk_descriptors,
+        }
+    }
+
+    fn emit_full_chunks(&mut self) -> io::Result<()> {
+        while self.pending.len() >= self.target_chunk_size {
+            let remainder = self.pending.split_off(self.target_chunk_size);
+            let chunk = std::mem::replace(&mut self.pending, remainder);
+            self.write_chunk(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn emit_remaining(&mut self) -> io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+
+        let chunk = std::mem::take(&mut self.pending);
+        self.write_chunk(chunk)
+    }
+
+    fn write_chunk(&mut self, chunk: Vec<u8>) -> io::Result<()> {
+        self.file.write_all(&chunk)?;
+        let chunk_len_u64 = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        self.chunk_descriptors.push(QueryStreamChunkDescriptor {
+            offset: self.current_offset,
+            len: chunk_len_u64,
+        });
+        self.current_offset = self.current_offset.saturating_add(chunk_len_u64);
+        self.emitted_chunks += 1;
+        self.emitted_bytes += chunk.len();
+        Ok(())
+    }
+}
+
+impl QueryStreamChunkWriter for TempFileChunkWriter {
+    fn emitted_chunk_count(&self) -> u64 {
+        u64::try_from(self.emitted_chunks).unwrap_or(u64::MAX)
+    }
+
+    fn emitted_total_bytes(&self) -> u64 {
+        u64::try_from(self.emitted_bytes).unwrap_or(u64::MAX)
+    }
+}
+
+impl Write for TempFileChunkWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+
+        self.pending.extend_from_slice(buf);
+        self.emit_full_chunks()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.emit_remaining()?;
+        self.file.flush()
+    }
+}
+
+fn make_query_stream_spool_path() -> PathBuf {
+    let unique = NEXT_QUERY_STREAM_SPOOL_ID.fetch_add(1, Ordering::Relaxed);
+    let file_name = format!(
+        "vldb-sqlite-query-stream-{}-{}-{}.bin",
+        std::process::id(),
+        unique,
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    );
+    std::env::temp_dir().join(file_name)
+}
+
 impl QueryStreamChunkWriter for ChunkCollector {
     fn emitted_chunk_count(&self) -> u64 {
         u64::try_from(self.emitted_chunks).unwrap_or(u64::MAX)
@@ -1115,7 +1305,8 @@ mod tests {
         .expect("query_stream should succeed");
         assert_eq!(result.row_count, 1);
         assert!(result.chunk_count >= 1);
-        assert!(!result.chunks.is_empty());
+        let first_chunk = result.read_chunk(0).expect("first chunk should be readable");
+        assert!(!first_chunk.is_empty());
     }
 
     #[test]
