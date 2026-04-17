@@ -1,0 +1,12 @@
+target/
+_tmp_data/
+data/
+*.arrow.stream
+*.log
+*.exe
+*.pdb
+*.db
+*.db-shm
+*.db-wal
+/docs/plan/
+/docs/completed/

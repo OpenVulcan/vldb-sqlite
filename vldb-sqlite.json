@@ -1,0 +1,35 @@
+{
+  "host": "0.0.0.0",
+  "port": 19501,
+  "db_path": "./data/sqlite.db",
+  "connection_pool_size": 8,
+  "busy_timeout_ms": 5000,
+  "pragmas": {
+    "journal_mode": "WAL",
+    "synchronous": "NORMAL",
+    "foreign_keys": true,
+    "temp_store": "MEMORY",
+    "wal_autocheckpoint_pages": 1000,
+    "cache_size_kib": 65536,
+    "mmap_size_bytes": 268435456
+  },
+  "hardening": {
+    "enforce_db_file_lock": true,
+    "read_only": false,
+    "allow_uri_filenames": false,
+    "trusted_schema": false,
+    "defensive": true
+  },
+  "logging": {
+    "enabled": true,
+    "file_enabled": true,
+    "stderr_enabled": true,
+    "request_log_enabled": true,
+    "slow_query_log_enabled": true,
+    "slow_query_threshold_ms": 1000,
+    "slow_query_full_sql_enabled": true,
+    "sql_preview_chars": 160,
+    "log_dir": "",
+    "log_file_name": "vldb-sqlite.log"
+  }
+}

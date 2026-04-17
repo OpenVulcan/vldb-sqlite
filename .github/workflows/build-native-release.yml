@@ -1,0 +1,489 @@
+name: Build Native Release Binaries
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "[vldb-sqlite] Release tag to build from main workflow (for example: v0.1.3)"
+        required: true
+        type: string
+      build_linux_x64:
+        description: "[vldb-sqlite] Build Linux x64"
+        required: true
+        default: true
+        type: boolean
+      build_linux_arm:
+        description: "[vldb-sqlite] Build Linux ARM"
+        required: true
+        default: true
+        type: boolean
+      build_mac_arm:
+        description: "[vldb-sqlite] Build macOS ARM"
+        required: true
+        default: true
+        type: boolean
+      build_mac_x64:
+        description: "[vldb-sqlite] Build macOS x64"
+        required: true
+        default: true
+        type: boolean
+      build_win_x64:
+        description: "[vldb-sqlite] Build Windows x64"
+        required: true
+        default: true
+        type: boolean
+      linux_x64:
+        description: "[vldb-sqlite] Linux x64 runner"
+        required: true
+        default: "ubuntu-24.04"
+        type: choice
+        options: [ "ubuntu-24.04", "9950x", "proart" ]
+      linux_arm:
+        description: "[vldb-sqlite] Linux ARM runner"
+        required: true
+        default: "ubuntu-24.04-arm"
+        type: choice
+        options: [ "ubuntu-24.04-arm", "ubuntu-24.04", "9950x", "proart" ]
+      mac_arm:
+        description: "[vldb-sqlite] macOS ARM runner"
+        required: true
+        default: "macos-15"
+        type: choice
+        options: [ "macos-15", "9950x", "proart" ]
+      mac_x64:
+        description: "[vldb-sqlite] macOS x64 runner"
+        required: true
+        default: "macos-15-intel"
+        type: choice
+        options: [ "macos-15-intel" ]
+      win_x64:
+        description: "[vldb-sqlite] Windows x64 runner"
+        required: true
+        default: "windows-latest"
+        type: choice
+        options: [ "windows-latest", "9950x-win", "proart-win" ]
+permissions:
+  contents: write
+
+concurrency:
+  group: native-release-${{ github.workflow }}-${{ github.ref_name || github.run_id }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  prepare-matrix:
+    name: Prepare Build Matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      release_tag: ${{ steps.matrix.outputs.release_tag }}
+      checkout_ref: ${{ steps.matrix.outputs.checkout_ref }}
+
+    steps:
+      - name: Build matrix JSON
+        id: matrix
+        shell: bash
+        env:
+          GITHUB_REF_TYPE: ${{ github.ref_type }}
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          BUILD_LINUX_X64: ${{ inputs.build_linux_x64 }}
+          BUILD_LINUX_ARM: ${{ inputs.build_linux_arm }}
+          BUILD_MAC_ARM: ${{ inputs.build_mac_arm }}
+          BUILD_MAC_X64: ${{ inputs.build_mac_x64 }}
+          BUILD_WIN_X64: ${{ inputs.build_win_x64 }}
+          RUNNER_LINUX_X64: ${{ inputs.linux_x64 || 'ubuntu-24.04' }}
+          RUNNER_LINUX_ARM: ${{ inputs.linux_arm || 'ubuntu-24.04-arm' }}
+          RUNNER_MAC_ARM: ${{ inputs.mac_arm || 'macos-15' }}
+          RUNNER_MAC_X64: ${{ inputs.mac_x64 || 'macos-15-intel' }}
+          RUNNER_WIN_X64: ${{ inputs.win_x64 || 'windows-latest' }}
+        run: |
+          set -euo pipefail
+
+          matrix='{"include":[]}'
+          resolved_tag="$INPUT_RELEASE_TAG"
+
+          if [[ "$GITHUB_REF_TYPE" != "branch" || "$GITHUB_REF_NAME" != "main" ]]; then
+            echo "This workflow must be triggered from the main branch Actions page." >&2
+            exit 1
+          fi
+
+          if [[ -z "$resolved_tag" ]]; then
+            echo "A release tag is required for native artifact builds." >&2
+            exit 1
+          fi
+
+          if [[ ! "$resolved_tag" =~ ^v.+$ ]]; then
+            echo "Release tag must start with 'v', got: $resolved_tag" >&2
+            exit 1
+          fi
+
+          add_entry() {
+            local enabled="$1"
+            local runner="$2"
+            local target="$3"
+
+            if [[ "$enabled" == "true" ]]; then
+              matrix="$(python -c 'import json,sys; m=json.loads(sys.argv[1]); m["include"].append({"runner": sys.argv[2], "target": sys.argv[3]}); print(json.dumps(m))' "$matrix" "$runner" "$target")"
+            fi
+          }
+
+          add_entry "$BUILD_LINUX_X64" "$RUNNER_LINUX_X64" "x86_64-unknown-linux-gnu"
+          add_entry "$BUILD_LINUX_ARM" "$RUNNER_LINUX_ARM" "aarch64-unknown-linux-gnu"
+          add_entry "$BUILD_MAC_ARM" "$RUNNER_MAC_ARM" "aarch64-apple-darwin"
+          add_entry "$BUILD_MAC_X64" "$RUNNER_MAC_X64" "x86_64-apple-darwin"
+          add_entry "$BUILD_WIN_X64" "$RUNNER_WIN_X64" "x86_64-pc-windows-msvc"
+
+          if [[ "$(python -c 'import json,sys; print(len(json.loads(sys.argv[1])["include"]))' "$matrix")" == "0" ]]; then
+            echo "At least one build target must be enabled." >&2
+            exit 1
+          fi
+
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$resolved_tag" >> "$GITHUB_OUTPUT"
+          echo "checkout_ref=refs/tags/$resolved_tag" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare-matrix
+    name: ${{ matrix.target }}
+    runs-on: >-
+      ${{
+        (startsWith(matrix.runner, 'ubuntu') || startsWith(matrix.runner, 'macos') || startsWith(matrix.runner, 'windows'))
+        && fromJSON(format('["{0}"]', matrix.runner))
+        || fromJSON(format('["self-hosted", "{0}"]', matrix.runner))
+      }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.prepare-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare-matrix.outputs.checkout_ref }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for pkg in pkg-config cmake clang protoc aarch64-linux-gnu-gcc aarch64-linux-gnu-g++; do
+            if ! command -v "$pkg" >/dev/null 2>&1; then
+              missing=1
+            fi
+          done
+
+          if [ "$missing" -eq 1 ] || ! dpkg -s libssl-dev >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y pkg-config cmake clang libssl-dev protobuf-compiler zip gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          fi
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew update
+          if ! command -v cmake >/dev/null 2>&1; then
+            brew install cmake
+          fi
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf
+          fi
+
+      - name: Install Windows build dependencies
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $missing = @()
+          foreach ($tool in @('cmake', 'protoc')) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              $missing += $tool
+            }
+          }
+
+          if ($missing.Count -gt 0) {
+            choco install -y cmake protoc --no-progress
+          }
+
+      - name: Set up Rust toolchain on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup default 1.94.0
+          rustup target add $env:TARGET
+
+      - name: Set up Rust toolchain on Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal
+          rustup default 1.94.0
+          rustup target add "$TARGET"
+
+      - name: Cache Rust build outputs on Windows
+        if: runner.os == 'Windows' && startsWith(matrix.runner, 'windows')
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~\.cargo\registry
+            ~\.cargo\git
+            target
+          key: native-release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            native-release-${{ runner.os }}-${{ matrix.target }}-
+            native-release-${{ runner.os }}-
+
+      - name: Cache Rust build outputs on Unix
+        if: runner.os != 'Windows' && (startsWith(matrix.runner, 'ubuntu') || startsWith(matrix.runner, 'macos'))
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: native-release-${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            native-release-${{ runner.os }}-${{ matrix.target }}-
+            native-release-${{ runner.os }}-
+
+      - name: Set up MSVC environment for Windows
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          vsversion: '2022'
+
+      - name: Build release binary and library artifacts
+        env:
+          CARGO_TERM_COLOR: always
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          CMAKE_OSX_ARCHITECTURES: ${{ matrix.target == 'aarch64-apple-darwin' && 'arm64' || matrix.target == 'x86_64-apple-darwin' && 'x86_64' || '' }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
+          CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc"
+          CXX_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-g++"
+        run: cargo build --locked --release --target ${{ matrix.target }} --bin vldb-sqlite --lib
+
+      - name: Package release archives on Windows runner
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          BINARY: vldb-sqlite
+          TARGET: ${{ matrix.target }}
+        run: |
+          $cargoToml = Join-Path $env:GITHUB_WORKSPACE 'Cargo.toml'
+          $content = Get-Content $cargoToml -Raw
+          if ($content -match '(?m)^version\s*=\s*"([^"]+)"') {
+            $version = $Matches[1]
+          } else {
+            $version = 'unknown'
+          }
+
+          $isWindowsTarget = $env:TARGET -like '*windows*'
+          $ext = if ($isWindowsTarget) { '.exe' } else { '' }
+          $packageName = "$($env:BINARY)-v$version-$($env:TARGET)"
+          $libPackageName = "$($env:BINARY)-lib-v$version-$($env:TARGET)"
+          $binPath = Join-Path $env:GITHUB_WORKSPACE "target/$($env:TARGET)/release/$($env:BINARY)$ext"
+          $dllPath = Join-Path $env:GITHUB_WORKSPACE "target/$($env:TARGET)/release/vldb_sqlite.dll"
+          $importLibPath = Join-Path $env:GITHUB_WORKSPACE "target/$($env:TARGET)/release/vldb_sqlite.dll.lib"
+          $headerPath = Join-Path $env:GITHUB_WORKSPACE 'include/vldb_sqlite.h'
+          $docPath = Join-Path $env:GITHUB_WORKSPACE 'docs/LIBRARY_USAGE.zh-CN.md'
+          $distDir = (New-Item -ItemType Directory -Force -Path (Join-Path $env:GITHUB_WORKSPACE 'dist')).FullName
+          $stageDir = (New-Item -ItemType Directory -Force -Path (Join-Path $distDir $packageName)).FullName
+          $libStageDir = (New-Item -ItemType Directory -Force -Path (Join-Path $distDir $libPackageName)).FullName
+          $archiveExt = if ($isWindowsTarget) { '.zip' } else { '.tar.gz' }
+          $archivePath = Join-Path $distDir "$packageName$archiveExt"
+          $libArchivePath = Join-Path $distDir "$libPackageName$archiveExt"
+          $checksumPath = "$archivePath.sha256"
+          $libChecksumPath = "$libArchivePath.sha256"
+
+          if (!(Test-Path $binPath)) {
+            Write-Error "Binary not found at $binPath"
+            exit 1
+          }
+          if (!(Test-Path $dllPath)) {
+            Write-Error "Dynamic library not found at $dllPath"
+            exit 1
+          }
+          if (!(Test-Path $headerPath)) {
+            Write-Error "Header not found at $headerPath"
+            exit 1
+          }
+          if (!(Test-Path $docPath)) {
+            Write-Error "Library usage document not found at $docPath"
+            exit 1
+          }
+
+          Copy-Item $binPath (Join-Path $stageDir "$($env:BINARY)$ext")
+          Copy-Item $dllPath (Join-Path $libStageDir 'vldb_sqlite.dll')
+          if (Test-Path $importLibPath) {
+            Copy-Item $importLibPath (Join-Path $libStageDir 'vldb_sqlite.dll.lib')
+          }
+          Copy-Item $headerPath $libStageDir
+          Copy-Item $docPath $libStageDir
+
+          $exampleFile = Join-Path $env:GITHUB_WORKSPACE "$($env:BINARY).json.example"
+          if (Test-Path $exampleFile) {
+            Copy-Item $exampleFile $stageDir
+          }
+
+          foreach ($fileName in @('README.md', 'LICENSE')) {
+            $path = Join-Path $env:GITHUB_WORKSPACE $fileName
+            if (Test-Path $path) {
+              Copy-Item $path $stageDir
+            }
+          }
+
+          if (Test-Path $archivePath) {
+            Remove-Item $archivePath -Force
+          }
+          if (Test-Path $libArchivePath) { Remove-Item $libArchivePath -Force }
+          if (Test-Path $checksumPath) { Remove-Item $checksumPath -Force }
+          if (Test-Path $libChecksumPath) { Remove-Item $libChecksumPath -Force }
+
+          if ($isWindowsTarget) {
+            Compress-Archive -Path (Join-Path $stageDir '*') -DestinationPath $archivePath -CompressionLevel Optimal
+            Compress-Archive -Path (Join-Path $libStageDir '*') -DestinationPath $libArchivePath -CompressionLevel Optimal
+          } else {
+            tar -czf $archivePath -C $distDir $packageName
+            tar -czf $libArchivePath -C $distDir $libPackageName
+          }
+
+          $hash = (Get-FileHash -Algorithm SHA256 $archivePath).Hash.ToLower()
+          "$hash  $(Split-Path -Leaf $archivePath)" | Out-File -FilePath $checksumPath -Encoding ascii -NoNewline
+          $libHash = (Get-FileHash -Algorithm SHA256 $libArchivePath).Hash.ToLower()
+          "$libHash  $(Split-Path -Leaf $libArchivePath)" | Out-File -FilePath $libChecksumPath -Encoding ascii -NoNewline
+
+      - name: Package release archives on Unix runner
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          BINARY: vldb-sqlite
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          cargo_toml="$GITHUB_WORKSPACE/Cargo.toml"
+          version="$(sed -nE 's/^version[[:space:]]*=[[:space:]]*"([^"]+)"/\1/p' "$cargo_toml" | head -n1)"
+          if [[ -z "$version" ]]; then
+            version="unknown"
+          fi
+
+          if [[ "$TARGET" == *windows* ]]; then
+            ext=".exe"
+            archive_ext=".zip"
+          else
+            ext=""
+            archive_ext=".tar.gz"
+          fi
+
+          package_name="${BINARY}-v${version}-${TARGET}"
+          lib_package_name="${BINARY}-lib-v${version}-${TARGET}"
+          bin_path="$GITHUB_WORKSPACE/target/$TARGET/release/$BINARY$ext"
+          if [[ "$TARGET" == *apple-darwin ]]; then
+            dynlib_name="libvldb_sqlite.dylib"
+          else
+            dynlib_name="libvldb_sqlite.so"
+          fi
+          dynlib_path="$GITHUB_WORKSPACE/target/$TARGET/release/$dynlib_name"
+          header_path="$GITHUB_WORKSPACE/include/vldb_sqlite.h"
+          doc_path="$GITHUB_WORKSPACE/docs/LIBRARY_USAGE.zh-CN.md"
+          dist_dir="$GITHUB_WORKSPACE/dist"
+          stage_dir="$dist_dir/$package_name"
+          lib_stage_dir="$dist_dir/$lib_package_name"
+          archive_path="$dist_dir/$package_name$archive_ext"
+          lib_archive_path="$dist_dir/$lib_package_name$archive_ext"
+          checksum_path="$archive_path.sha256"
+          lib_checksum_path="$lib_archive_path.sha256"
+
+          mkdir -p "$stage_dir"
+          mkdir -p "$lib_stage_dir"
+
+          if [[ ! -f "$bin_path" ]]; then
+            echo "Binary not found at $bin_path" >&2
+            exit 1
+          fi
+          if [[ ! -f "$dynlib_path" ]]; then
+            echo "Dynamic library not found at $dynlib_path" >&2
+            exit 1
+          fi
+          if [[ ! -f "$header_path" ]]; then
+            echo "Header not found at $header_path" >&2
+            exit 1
+          fi
+          if [[ ! -f "$doc_path" ]]; then
+            echo "Library usage document not found at $doc_path" >&2
+            exit 1
+          fi
+
+          cp "$bin_path" "$stage_dir/$BINARY$ext"
+          cp "$dynlib_path" "$lib_stage_dir/$dynlib_name"
+          cp "$header_path" "$lib_stage_dir/"
+          cp "$doc_path" "$lib_stage_dir/"
+
+          example_file="$GITHUB_WORKSPACE/$BINARY.json.example"
+          if [[ -f "$example_file" ]]; then
+            cp "$example_file" "$stage_dir/"
+          fi
+
+          for file_name in README.md LICENSE; do
+            if [[ -f "$GITHUB_WORKSPACE/$file_name" ]]; then
+              cp "$GITHUB_WORKSPACE/$file_name" "$stage_dir/"
+            fi
+          done
+
+          rm -f "$archive_path" "$checksum_path" "$lib_archive_path" "$lib_checksum_path"
+
+          if [[ "$archive_ext" == ".zip" ]]; then
+            (cd "$dist_dir" && zip -r -q "$(basename "$archive_path")" "$package_name")
+            (cd "$dist_dir" && zip -r -q "$(basename "$lib_archive_path")" "$lib_package_name")
+          else
+            tar -czf "$archive_path" -C "$dist_dir" "$package_name"
+            tar -czf "$lib_archive_path" -C "$dist_dir" "$lib_package_name"
+          fi
+
+          cd "$dist_dir"
+          filename="$(basename "$archive_path")"
+          lib_filename="$(basename "$lib_archive_path")"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$filename" > "$checksum_path"
+            sha256sum "$lib_filename" > "$lib_checksum_path"
+          else
+            shasum -a 256 "$filename" > "$checksum_path"
+            shasum -a 256 "$lib_filename" > "$lib_checksum_path"
+          fi
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: vldb-sqlite-${{ matrix.target }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish node artifacts to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare-matrix.outputs.release_tag }}
+          name: ${{ needs.prepare-matrix.outputs.release_tag }}
+          draft: false
+          prerelease: false
+          overwrite_files: true
+          fail_on_unmatched_files: false
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256

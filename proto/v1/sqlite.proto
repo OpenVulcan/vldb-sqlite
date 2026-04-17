@@ -1,0 +1,203 @@
+syntax = "proto3";
+
+package vldb.sqlite.v1;
+
+option go_package = "vldb-sqlite-go-demo/proto/v1;sqlitev1";
+
+service SqliteService {
+  rpc ExecuteScript(ExecuteRequest) returns (ExecuteResponse);
+  rpc ExecuteBatch(ExecuteBatchRequest) returns (ExecuteBatchResponse);
+  rpc QueryJson(QueryRequest) returns (QueryJsonResponse);
+  rpc QueryStream(QueryRequest) returns (stream QueryResponse);
+  rpc TokenizeText(TokenizeTextRequest) returns (TokenizeTextResponse);
+  rpc ListCustomWords(ListCustomWordsRequest) returns (ListCustomWordsResponse);
+  rpc UpsertCustomWord(UpsertCustomWordRequest) returns (DictionaryMutationResponse);
+  rpc RemoveCustomWord(RemoveCustomWordRequest) returns (DictionaryMutationResponse);
+  rpc EnsureFtsIndex(EnsureFtsIndexRequest) returns (EnsureFtsIndexResponse);
+  rpc RebuildFtsIndex(RebuildFtsIndexRequest) returns (RebuildFtsIndexResponse);
+  rpc UpsertFtsDocument(UpsertFtsDocumentRequest) returns (FtsMutationResponse);
+  rpc DeleteFtsDocument(DeleteFtsDocumentRequest) returns (FtsMutationResponse);
+  rpc SearchFts(SearchFtsRequest) returns (SearchFtsResponse);
+}
+
+message NullValue {}
+
+message SqliteValue {
+  oneof kind {
+    sint64 int64_value = 1;
+    double float64_value = 2;
+    string string_value = 3;
+    bytes bytes_value = 4;
+    bool bool_value = 5;
+    NullValue null_value = 6;
+  }
+}
+
+message ExecuteRequest {
+  string sql = 1;
+  string params_json = 2;
+  repeated SqliteValue params = 3;
+}
+
+message ExecuteResponse {
+  bool success = 1;
+  string message = 2;
+  int64 rows_changed = 3;
+  int64 last_insert_rowid = 4;
+}
+
+message ExecuteBatchRequest {
+  string sql = 1;
+  repeated ExecuteBatchItem items = 2;
+}
+
+message ExecuteBatchItem {
+  repeated SqliteValue params = 1;
+}
+
+message ExecuteBatchResponse {
+  bool success = 1;
+  string message = 2;
+  int64 rows_changed = 3;
+  int64 last_insert_rowid = 4;
+  int64 statements_executed = 5;
+}
+
+message QueryRequest {
+  string sql = 1;
+  string params_json = 2;
+  repeated SqliteValue params = 3;
+}
+
+message QueryResponse {
+  bytes arrow_ipc_chunk = 1;
+}
+
+message QueryJsonResponse {
+  string json_data = 1;
+}
+
+enum TokenizerMode {
+  TOKENIZER_MODE_UNSPECIFIED = 0;
+  TOKENIZER_MODE_NONE = 1;
+  TOKENIZER_MODE_JIEBA = 2;
+}
+
+message TokenizeTextRequest {
+  string text = 1;
+  TokenizerMode tokenizer_mode = 2;
+  bool search_mode = 3;
+}
+
+message TokenizeTextResponse {
+  string tokenizer_mode = 1;
+  string normalized_text = 2;
+  repeated string tokens = 3;
+  string fts_query = 4;
+}
+
+message ListCustomWordsRequest {}
+
+message CustomWordItem {
+  string word = 1;
+  uint64 weight = 2;
+}
+
+message ListCustomWordsResponse {
+  bool success = 1;
+  string message = 2;
+  repeated CustomWordItem words = 3;
+}
+
+message UpsertCustomWordRequest {
+  string word = 1;
+  uint32 weight = 2;
+}
+
+message RemoveCustomWordRequest {
+  string word = 1;
+}
+
+message DictionaryMutationResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 affected_rows = 3;
+}
+
+message EnsureFtsIndexRequest {
+  string index_name = 1;
+  TokenizerMode tokenizer_mode = 2;
+}
+
+message EnsureFtsIndexResponse {
+  bool success = 1;
+  string message = 2;
+  string index_name = 3;
+  string tokenizer_mode = 4;
+}
+
+message RebuildFtsIndexRequest {
+  string index_name = 1;
+  TokenizerMode tokenizer_mode = 2;
+}
+
+message RebuildFtsIndexResponse {
+  bool success = 1;
+  string message = 2;
+  string index_name = 3;
+  string tokenizer_mode = 4;
+  uint64 reindexed_rows = 5;
+}
+
+message UpsertFtsDocumentRequest {
+  string index_name = 1;
+  TokenizerMode tokenizer_mode = 2;
+  string id = 3;
+  string file_path = 4;
+  string title = 5;
+  string content = 6;
+}
+
+message DeleteFtsDocumentRequest {
+  string index_name = 1;
+  string id = 2;
+}
+
+message FtsMutationResponse {
+  bool success = 1;
+  string message = 2;
+  uint64 affected_rows = 3;
+  string index_name = 4;
+}
+
+message SearchFtsRequest {
+  string index_name = 1;
+  TokenizerMode tokenizer_mode = 2;
+  string query = 3;
+  uint32 limit = 4;
+  uint32 offset = 5;
+}
+
+message SearchFtsHit {
+  string id = 1;
+  string file_path = 2;
+  string title = 3;
+  string title_highlight = 4;
+  string content_snippet = 5;
+  double score = 6;
+  uint64 rank = 7;
+  double raw_score = 8;
+}
+
+message SearchFtsResponse {
+  bool success = 1;
+  string message = 2;
+  string index_name = 3;
+  string tokenizer_mode = 4;
+  string normalized_query = 5;
+  string fts_query = 6;
+  uint64 total = 7;
+  repeated SearchFtsHit hits = 8;
+  string source = 9;
+  string query_mode = 10;
+}
