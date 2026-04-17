@@ -199,6 +199,7 @@ type QueryStreamHandle struct {
 	RowCount   uint64
 	ChunkCount uint64
 	TotalBytes uint64
+	metricsLoaded bool
 }
 
 // Library 表示已加载的 vldb-sqlite 动态库。
@@ -603,16 +604,39 @@ func (db *Database) QueryStream(sql string, params []SQLValue, paramsJSON string
 		return nil, db.lib.lastError()
 	}
 	stream := &QueryStreamHandle{
-		lib:        db.lib,
-		handle:     resultHandle,
-		RowCount:   db.lib.queryStreamRowCount(resultHandle),
-		ChunkCount: db.lib.queryStreamChunkCount(resultHandle),
-		TotalBytes: db.lib.queryStreamTotalBytes(resultHandle),
+		lib:           db.lib,
+		handle:        resultHandle,
+		RowCount:      0,
+		ChunkCount:    0,
+		TotalBytes:    0,
+		metricsLoaded: false,
 	}
 	runtime.SetFinalizer(stream, func(handle *QueryStreamHandle) {
 		_ = handle.Close()
 	})
 	return stream, nil
+}
+
+// WaitMetrics 等待底层 QueryStream 完成并刷新最终统计信息。
+// WaitMetrics waits for the underlying QueryStream to finish and refreshes final metrics.
+func (stream *QueryStreamHandle) WaitMetrics() error {
+	if stream == nil || stream.handle == nil {
+		return errors.New("query stream handle is nil / QueryStream 句柄为空")
+	}
+	stream.RowCount = stream.lib.queryStreamRowCount(stream.handle)
+	if err := stream.lib.lastError(); err != nil {
+		return err
+	}
+	stream.ChunkCount = stream.lib.queryStreamChunkCount(stream.handle)
+	if err := stream.lib.lastError(); err != nil {
+		return err
+	}
+	stream.TotalBytes = stream.lib.queryStreamTotalBytes(stream.handle)
+	if err := stream.lib.lastError(); err != nil {
+		return err
+	}
+	stream.metricsLoaded = true
+	return nil
 }
 
 // CollectQueryStream 执行流式查询并一次性聚合所有 chunk。
@@ -625,6 +649,10 @@ func (db *Database) CollectQueryStream(sql string, params []SQLValue, paramsJSON
 	defer func() {
 		_ = stream.Close()
 	}()
+
+	if err := stream.WaitMetrics(); err != nil {
+		return QueryStreamResult{}, err
+	}
 
 	chunks, err := stream.CollectAll()
 	if err != nil {
@@ -664,6 +692,11 @@ func (stream *QueryStreamHandle) ReadChunk(index uint64) ([]byte, error) {
 func (stream *QueryStreamHandle) CollectAll() ([][]byte, error) {
 	if stream == nil || stream.handle == nil {
 		return nil, errors.New("query stream handle is nil / QueryStream 句柄为空")
+	}
+	if !stream.metricsLoaded {
+		if err := stream.WaitMetrics(); err != nil {
+			return nil, err
+		}
 	}
 	chunks := make([][]byte, 0, stream.ChunkCount)
 	for i := uint64(0); i < stream.ChunkCount; i++ {

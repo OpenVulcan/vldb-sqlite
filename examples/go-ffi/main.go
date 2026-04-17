@@ -163,13 +163,23 @@ func main() {
 			log.Printf("关闭流式查询句柄失败 / failed to close query stream handle: %v", closeErr)
 		}
 	}()
+
+	firstChunk, err := streamHandle.ReadChunk(0)
+	if err != nil {
+		log.Fatalf("读取首个流式查询 chunk 失败 / failed to read first query stream chunk: %v", err)
+	}
+	log.Printf("首个流式查询 chunk / first query stream chunk: index=0 bytes=%d", len(firstChunk))
+
+	if err := streamHandle.WaitMetrics(); err != nil {
+		log.Fatalf("等待流式查询统计信息失败 / failed to wait query stream metrics: %v", err)
+	}
 	log.Printf(
 		"流式查询结果 / query stream result: rows=%d chunks=%d total_bytes=%d",
 		streamHandle.RowCount,
 		streamHandle.ChunkCount,
 		streamHandle.TotalBytes,
 	)
-	for i := uint64(0); i < streamHandle.ChunkCount; i++ {
+	for i := uint64(1); i < streamHandle.ChunkCount; i++ {
 		chunk, chunkErr := streamHandle.ReadChunk(i)
 		if chunkErr != nil {
 			log.Fatalf("读取流式查询 chunk 失败 / failed to read query stream chunk: %v", chunkErr)

@@ -55,6 +55,7 @@ go run . /path/to/libvldb_sqlite.dylib
   - `QueryStream` 句柄式渐进读取
   - tokenizer + FTS
 - `QueryStream()` 现在返回流句柄，调用方可以按 chunk 逐块消费结果，而不是一次性把全部 chunk 聚合进内存
+- `QueryStream()` 不会在创建时立刻阻塞等待最终统计信息；如果调用方需要最终 `row/chunk/bytes` 统计，请显式调用 `WaitMetrics()`
 - 如果调用方确实需要历史上的“全量聚合”行为，可显式使用 `CollectQueryStream()` 辅助接口
 - JSON 兼容层未作为主路径使用
 - 如果后续要给生产 Go 项目接入，建议把 `sqliteffi` 目录抽成独立内部包，再补：

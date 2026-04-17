@@ -9,6 +9,7 @@ use crate::runtime::{
 };
 use crate::sql_exec::{
     DEFAULT_IPC_CHUNK_BYTES, QueryJsonResult, QueryStreamResult, SqlExecCoreError,
+    QueryStreamChunkWriter, QueryStreamMetrics, query_stream_with_writer,
     count_sql_statements, execute_batch as execute_batch_core, execute_script as execute_script_core,
     parse_legacy_params_json, query_json as query_json_core, query_stream as query_stream_core,
 };
@@ -20,9 +21,14 @@ use rusqlite::Connection;
 use rusqlite::types::Value as SqliteValue;
 use serde::{Deserialize, Serialize};
 use std::ffi::{CStr, CString, c_char};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// FFI 状态码，供 Go / C 调用方判断调用是否成功。
 /// FFI status code used by Go / C callers to determine whether an invocation succeeded.
@@ -111,7 +117,271 @@ pub struct VldbSqliteQueryJsonResultHandle {
 pub struct VldbSqliteQueryStreamHandle {
     /// 内部 Arrow IPC chunk 查询结果句柄。
     /// Internal Arrow IPC chunk query-result handle.
-    inner: QueryStreamResult,
+    inner: Arc<FfiQueryStreamSharedState>,
+}
+
+/// 主 FFI QueryStream 单个 chunk 的文件偏移描述。
+/// File-offset descriptor for a single main-FFI QueryStream chunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FfiQueryStreamChunkDescriptor {
+    /// chunk 在暂存文件中的起始偏移。
+    /// Starting offset of the chunk in the spool file.
+    offset: u64,
+    /// chunk 的字节长度。
+    /// Byte length of the chunk.
+    len: u64,
+}
+
+/// 主 FFI QueryStream 的共享内部状态。
+/// Shared internal state for the main-FFI QueryStream.
+#[derive(Debug)]
+struct FfiQueryStreamSharedInner {
+    /// 暂存文件路径。
+    /// Spool file path.
+    file_path: PathBuf,
+    /// 已生成的 chunk 索引。
+    /// Descriptors for chunks already produced.
+    chunk_descriptors: Vec<FfiQueryStreamChunkDescriptor>,
+    /// 最终返回行数。
+    /// Final row count.
+    row_count: u64,
+    /// 最终 chunk 数量。
+    /// Final chunk count.
+    chunk_count: u64,
+    /// 最终总字节数。
+    /// Final total byte size.
+    total_bytes: u64,
+    /// 是否已完成生成。
+    /// Whether generation has completed.
+    complete: bool,
+    /// 异常信息（如果有）。
+    /// Failure message, if generation failed.
+    error: Option<String>,
+}
+
+/// 主 FFI QueryStream 的共享状态包装。
+/// Shared state wrapper for the main-FFI QueryStream.
+#[derive(Debug)]
+struct FfiQueryStreamSharedState {
+    /// 共享可变状态。
+    /// Shared mutable state.
+    inner: Mutex<FfiQueryStreamSharedInner>,
+    /// 用于等待 chunk 或完成信号。
+    /// Condvar used to wait for chunks or completion.
+    ready: Condvar,
+}
+
+impl FfiQueryStreamSharedState {
+    fn new(file_path: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(FfiQueryStreamSharedInner {
+                file_path,
+                chunk_descriptors: Vec::new(),
+                row_count: 0,
+                chunk_count: 0,
+                total_bytes: 0,
+                complete: false,
+                error: None,
+            }),
+            ready: Condvar::new(),
+        })
+    }
+
+    fn register_chunk(&self, offset: u64, len: u64) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .chunk_descriptors
+            .push(FfiQueryStreamChunkDescriptor { offset, len });
+        self.ready.notify_all();
+    }
+
+    fn finish(&self, metrics: QueryStreamMetrics) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.row_count = metrics.row_count;
+        guard.chunk_count = metrics.chunk_count;
+        guard.total_bytes = metrics.total_bytes;
+        guard.complete = true;
+        self.ready.notify_all();
+    }
+
+    fn fail(&self, error: String) {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.error = Some(error);
+        guard.complete = true;
+        self.ready.notify_all();
+    }
+
+    fn wait_for_metrics(&self) -> Result<(u64, u64, u64), String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string())?;
+        while !guard.complete {
+            guard = self
+                .ready
+                .wait(guard)
+                .map_err(|_| "failed to wait for query stream completion / 等待 QueryStream 完成失败".to_string())?;
+        }
+        if let Some(error) = guard.error.clone() {
+            return Err(error);
+        }
+        Ok((guard.chunk_count, guard.row_count, guard.total_bytes))
+    }
+
+    fn read_chunk(&self, index: usize) -> Result<Vec<u8>, String> {
+        let (file_path, descriptor) = {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string())?;
+            loop {
+                if let Some(descriptor) = guard.chunk_descriptors.get(index).copied() {
+                    break (guard.file_path.clone(), descriptor);
+                }
+                if let Some(error) = guard.error.clone() {
+                    return Err(error);
+                }
+                if guard.complete {
+                    return Err("chunk index out of bounds / chunk 下标越界".to_string());
+                }
+                guard = self
+                    .ready
+                    .wait(guard)
+                    .map_err(|_| "failed to wait for query stream chunk / 等待 QueryStream chunk 失败".to_string())?;
+            }
+        };
+
+        let mut file = File::open(&file_path)
+            .map_err(|error| format!("open query stream spool file failed: {error}"))?;
+        file.seek(SeekFrom::Start(descriptor.offset))
+            .map_err(|error| format!("seek query stream spool file failed: {error}"))?;
+        let chunk_len = usize::try_from(descriptor.len)
+            .map_err(|_| "query stream chunk length exceeds usize / QueryStream chunk 长度超过 usize".to_string())?;
+        let mut chunk = vec![0_u8; chunk_len];
+        file.read_exact(&mut chunk)
+            .map_err(|error| format!("read query stream spool chunk failed: {error}"))?;
+        Ok(chunk)
+    }
+}
+
+impl Drop for FfiQueryStreamSharedState {
+    fn drop(&mut self) {
+        let file_path = self
+            .inner
+            .lock()
+            .map(|guard| guard.file_path.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().file_path.clone());
+        let _ = std::fs::remove_file(file_path);
+    }
+}
+
+/// 主 FFI QueryStream 的后台文件写入器。
+/// Background file writer used by the main-FFI QueryStream.
+struct FfiStreamingTempFileWriter {
+    file: File,
+    state: Arc<FfiQueryStreamSharedState>,
+    pending: Vec<u8>,
+    target_chunk_size: usize,
+    emitted_chunks: usize,
+    emitted_bytes: usize,
+    current_offset: u64,
+}
+
+impl FfiStreamingTempFileWriter {
+    fn new(state: Arc<FfiQueryStreamSharedState>, target_chunk_size: usize) -> Result<Self, String> {
+        let chunk_size = target_chunk_size.max(64 * 1024);
+        let file_path = {
+            let guard = state
+                .inner
+                .lock()
+                .map_err(|_| "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string())?;
+            guard.file_path.clone()
+        };
+        let file = File::create(&file_path)
+            .map_err(|error| format!("create query stream spool file failed: {error}"))?;
+        Ok(Self {
+            file,
+            state,
+            pending: Vec::with_capacity(chunk_size),
+            target_chunk_size: chunk_size,
+            emitted_chunks: 0,
+            emitted_bytes: 0,
+            current_offset: 0,
+        })
+    }
+
+    fn emit_full_chunks(&mut self) -> std::io::Result<()> {
+        while self.pending.len() >= self.target_chunk_size {
+            let remainder = self.pending.split_off(self.target_chunk_size);
+            let chunk = std::mem::replace(&mut self.pending, remainder);
+            self.write_chunk(chunk)?;
+        }
+        Ok(())
+    }
+
+    fn emit_remaining(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let chunk = std::mem::take(&mut self.pending);
+        self.write_chunk(chunk)
+    }
+
+    fn write_chunk(&mut self, chunk: Vec<u8>) -> std::io::Result<()> {
+        self.file.write_all(&chunk)?;
+        let chunk_len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+        self.state.register_chunk(self.current_offset, chunk_len);
+        self.current_offset = self.current_offset.saturating_add(chunk_len);
+        self.emitted_chunks += 1;
+        self.emitted_bytes += chunk.len();
+        Ok(())
+    }
+}
+
+impl QueryStreamChunkWriter for FfiStreamingTempFileWriter {
+    fn emitted_chunk_count(&self) -> u64 {
+        u64::try_from(self.emitted_chunks).unwrap_or(u64::MAX)
+    }
+
+    fn emitted_total_bytes(&self) -> u64 {
+        u64::try_from(self.emitted_bytes).unwrap_or(u64::MAX)
+    }
+}
+
+impl Write for FfiStreamingTempFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        self.pending.extend_from_slice(buf);
+        self.emit_full_chunks()?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.emit_remaining()?;
+        self.file.flush()
+    }
+}
+
+/// JSON QueryStream 注册表条目。
+/// JSON QueryStream registry entry.
+struct JsonQueryStreamEntry {
+    /// 暂存后的流结果。
+    /// Spool-backed stream result.
+    result: QueryStreamResult,
+    /// 最近访问时间。
+    /// Last access time.
+    last_accessed_at: Instant,
 }
 
 /// 非 JSON FFI 的 SQL 执行结果。
@@ -286,15 +556,29 @@ pub struct VldbSqliteFfiValueSlice {
 /// Cache for the latest FFI error message.
 static LAST_ERROR: OnceLock<Mutex<Option<CString>>> = OnceLock::new();
 static NEXT_JSON_STREAM_ID: AtomicU64 = AtomicU64::new(1);
-static JSON_QUERY_STREAMS: OnceLock<Mutex<std::collections::HashMap<u64, QueryStreamResult>>> =
+static NEXT_MAIN_FFI_STREAM_ID: AtomicU64 = AtomicU64::new(1);
+static JSON_QUERY_STREAMS: OnceLock<Mutex<std::collections::HashMap<u64, JsonQueryStreamEntry>>> =
     OnceLock::new();
+static JSON_QUERY_STREAM_CLEANER: OnceLock<()> = OnceLock::new();
+
+const JSON_QUERY_STREAM_TTL: Duration = Duration::from_secs(300);
+const JSON_QUERY_STREAM_CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
+const JSON_QUERY_STREAM_MAX_ENTRIES: usize = 64;
 
 fn last_error_slot() -> &'static Mutex<Option<CString>> {
     LAST_ERROR.get_or_init(|| Mutex::new(None))
 }
 
 fn json_query_stream_registry(
-) -> &'static Mutex<std::collections::HashMap<u64, QueryStreamResult>> {
+) -> &'static Mutex<std::collections::HashMap<u64, JsonQueryStreamEntry>> {
+    JSON_QUERY_STREAM_CLEANER.get_or_init(|| {
+        thread::spawn(|| loop {
+            thread::sleep(JSON_QUERY_STREAM_CLEANUP_INTERVAL);
+            if let Ok(mut guard) = json_query_stream_registry().lock() {
+                cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
+            }
+        });
+    });
     JSON_QUERY_STREAMS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -686,6 +970,68 @@ fn sql_exec_error_to_string(error: SqlExecCoreError) -> String {
     error.to_string()
 }
 
+fn make_main_ffi_query_stream_spool_path() -> PathBuf {
+    let unique = NEXT_MAIN_FFI_STREAM_ID.fetch_add(1, Ordering::Relaxed);
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_millis())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "vldb-sqlite-ffi-query-stream-{}-{}-{}.bin",
+        std::process::id(),
+        unique,
+        millis
+    ))
+}
+
+fn start_main_ffi_query_stream(
+    database: Arc<SqliteDatabaseHandle>,
+    sql: String,
+    bound_values: Vec<SqliteValue>,
+    target_chunk_size: usize,
+) -> Arc<FfiQueryStreamSharedState> {
+    let state = FfiQueryStreamSharedState::new(make_main_ffi_query_stream_spool_path());
+    let worker_state = Arc::clone(&state);
+    thread::spawn(move || {
+        let result = (|| -> Result<QueryStreamMetrics, String> {
+            let mut connection = database
+                .open_connection()
+                .map_err(|error| format!("failed to open runtime-managed sqlite connection: {error}"))?;
+            let writer = FfiStreamingTempFileWriter::new(Arc::clone(&worker_state), target_chunk_size)?;
+            let (_writer, metrics) = query_stream_with_writer(&mut connection, &sql, &bound_values, writer)
+                .map_err(sql_exec_error_to_string)?;
+            Ok(metrics)
+        })();
+
+        match result {
+            Ok(metrics) => worker_state.finish(metrics),
+            Err(error) => worker_state.fail(error),
+        }
+    });
+    state
+}
+
+fn cleanup_json_query_stream_registry_at(
+    guard: &mut std::collections::HashMap<u64, JsonQueryStreamEntry>,
+    now: Instant,
+) {
+    guard.retain(|_, entry| now.duration_since(entry.last_accessed_at) <= JSON_QUERY_STREAM_TTL);
+
+    if guard.len() <= JSON_QUERY_STREAM_MAX_ENTRIES {
+        return;
+    }
+
+    let mut ordered = guard
+        .iter()
+        .map(|(stream_id, entry)| (*stream_id, entry.last_accessed_at))
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, last_accessed_at)| *last_accessed_at);
+    let remove_count = guard.len().saturating_sub(JSON_QUERY_STREAM_MAX_ENTRIES);
+    for (stream_id, _) in ordered.into_iter().take(remove_count) {
+        guard.remove(&stream_id);
+    }
+}
+
 /// 注册 JSON 兼容层的 QueryStream 结果并返回流句柄 ID。
 /// Register a JSON-compat QueryStream result and return its stream-handle ID.
 fn register_json_query_stream(result: QueryStreamResult) -> Result<u64, String> {
@@ -693,7 +1039,14 @@ fn register_json_query_stream(result: QueryStreamResult) -> Result<u64, String> 
     let mut guard = json_query_stream_registry()
         .lock()
         .map_err(|_| "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string())?;
-    guard.insert(stream_id, result);
+    cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
+    guard.insert(
+        stream_id,
+        JsonQueryStreamEntry {
+            result,
+            last_accessed_at: Instant::now(),
+        },
+    );
     Ok(stream_id)
 }
 
@@ -703,13 +1056,15 @@ fn with_json_query_stream<T>(
     stream_id: u64,
     f: impl FnOnce(&QueryStreamResult) -> Result<T, String>,
 ) -> Result<T, String> {
-    let guard = json_query_stream_registry()
+    let mut guard = json_query_stream_registry()
         .lock()
         .map_err(|_| "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string())?;
-    let result = guard
-        .get(&stream_id)
+    cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
+    let entry = guard
+        .get_mut(&stream_id)
         .ok_or_else(|| format!("query stream handle not found: {stream_id} / QueryStream 句柄不存在"))?;
-    f(result)
+    entry.last_accessed_at = Instant::now();
+    f(&entry.result)
 }
 
 /// 关闭并移除 JSON 兼容层的 QueryStream 结果。
@@ -718,6 +1073,7 @@ fn close_json_query_stream(stream_id: u64) -> Result<bool, String> {
     let mut guard = json_query_stream_registry()
         .lock()
         .map_err(|_| "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string())?;
+    cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
     Ok(guard.remove(&stream_id).is_some())
 }
 
@@ -1186,17 +1542,16 @@ pub extern "C" fn vldb_sqlite_database_query_stream(
     clear_last_error_inner();
     match (|| -> Result<VldbSqliteQueryStreamHandle, String> {
         let sql = c_json_arg_to_string(sql)?;
-        let mut connection = open_connection_for_handle(handle)?;
         let bound_values = ffi_values_from_parts(params, params_len, params_json)?;
+        let database = Arc::clone(&database_handle_ref(handle)?.inner);
         let target_chunk_size = if chunk_bytes == 0 {
             DEFAULT_IPC_CHUNK_BYTES
         } else {
             usize::try_from(chunk_bytes)
                 .map_err(|_| "chunk_bytes exceeds usize / chunk_bytes 超过 usize".to_string())?
         };
-        let result = query_stream_core(&mut connection, &sql, &bound_values, target_chunk_size)
-            .map_err(sql_exec_error_to_string)?;
-        Ok(VldbSqliteQueryStreamHandle { inner: result })
+        let state = start_main_ffi_query_stream(database, sql, bound_values, target_chunk_size);
+        Ok(VldbSqliteQueryStreamHandle { inner: state })
     })() {
         Ok(result) => Box::into_raw(Box::new(result)),
         Err(error) => {
@@ -1358,7 +1713,13 @@ pub extern "C" fn vldb_sqlite_query_stream_chunk_count(
     handle: *mut VldbSqliteQueryStreamHandle,
 ) -> u64 {
     match query_stream_handle_ref(handle) {
-        Ok(handle) => handle.inner.chunk_count,
+        Ok(handle) => match handle.inner.wait_for_metrics() {
+            Ok((chunk_count, _, _)) => chunk_count,
+            Err(error) => {
+                update_last_error(error);
+                0
+            }
+        },
         Err(error) => {
             update_last_error(error);
             0
@@ -1373,7 +1734,13 @@ pub extern "C" fn vldb_sqlite_query_stream_row_count(
     handle: *mut VldbSqliteQueryStreamHandle,
 ) -> u64 {
     match query_stream_handle_ref(handle) {
-        Ok(handle) => handle.inner.row_count,
+        Ok(handle) => match handle.inner.wait_for_metrics() {
+            Ok((_, row_count, _)) => row_count,
+            Err(error) => {
+                update_last_error(error);
+                0
+            }
+        },
         Err(error) => {
             update_last_error(error);
             0
@@ -1388,7 +1755,13 @@ pub extern "C" fn vldb_sqlite_query_stream_total_bytes(
     handle: *mut VldbSqliteQueryStreamHandle,
 ) -> u64 {
     match query_stream_handle_ref(handle) {
-        Ok(handle) => handle.inner.total_bytes,
+        Ok(handle) => match handle.inner.wait_for_metrics() {
+            Ok((_, _, total_bytes)) => total_bytes,
+            Err(error) => {
+                update_last_error(error);
+                0
+            }
+        },
         Err(error) => {
             update_last_error(error);
             0
@@ -1406,13 +1779,10 @@ pub extern "C" fn vldb_sqlite_query_stream_get_chunk(
     clear_last_error_inner();
     match (|| -> Result<VldbSqliteByteBuffer, String> {
         let handle = query_stream_handle_ref(handle)?;
-        let chunk = handle
-            .inner
-            .read_chunk(
-                usize::try_from(index)
-                    .map_err(|_| "chunk index exceeds usize / chunk 下标超过 usize".to_string())?,
-            )
-            .map_err(sql_exec_error_to_string)?;
+        let chunk = handle.inner.read_chunk(
+            usize::try_from(index)
+                .map_err(|_| "chunk index exceeds usize / chunk 下标超过 usize".to_string())?,
+        )?;
         Ok(bytes_to_buffer(&chunk))
     })() {
         Ok(buffer) => buffer,
