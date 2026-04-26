@@ -4,6 +4,30 @@ version = "0.1.5"
 edition = "2024"
 rust-version = "1.94"
 build = "build.rs"
+description = "A Rust gRPC, library, and FFI gateway for SQLite with JSON and Arrow IPC query paths."
+license = "MIT"
+repository = "https://github.com/OpenVulcan/vldb-sqlite"
+homepage = "https://github.com/OpenVulcan/vldb-sqlite"
+documentation = "https://docs.rs/vldb-sqlite"
+readme = "README.md"
+keywords = ["sqlite", "grpc", "ffi", "arrow", "vldb"]
+categories = ["database", "network-programming"]
+include = [
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/build.rs",
+    "/src/**",
+    "/proto/**",
+    "/include/**",
+    "/docs/README.en.md",
+    "/docs/README.zh-CN.md",
+    "/docs/LIBRARY_USAGE.zh-CN.md",
+    "/docs/grpc-integration.en.md",
+    "/docs/grpc-integration.zh-CN.md",
+    "/vldb-sqlite.json.example",
+]
 
 [lib]
 name = "vldb_sqlite"
