@@ -262,7 +262,6 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
-          vsversion: '2022'
 
       - name: Build release binary and library artifacts
         env:
