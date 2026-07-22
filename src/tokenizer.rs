@@ -120,14 +120,20 @@ pub struct ListCustomWordsResult {
 
 /// 共享词典状态（中英双语）。
 /// Shared dictionary state reused by all SQLite connections for the same database (bilingual).
-#[derive(Debug, Default)]
 struct SharedDictionaryState {
-    custom_words: Vec<CustomWordEntry>,
+    jieba: Jieba,
+}
+
+impl Default for SharedDictionaryState {
+    fn default() -> Self {
+        Self {
+            jieba: Jieba::new(),
+        }
+    }
 }
 
 /// SQLite 注册阶段持有的 tokenizer 上下文（中英双语）。
 /// Tokenizer registration context held by SQLite during tokenizer registration (bilingual).
-#[derive(Debug)]
 struct RegisteredTokenizerContext {
     connection_handle: usize,
     shared_state: Arc<RwLock<SharedDictionaryState>>,
@@ -135,7 +141,6 @@ struct RegisteredTokenizerContext {
 
 /// SQLite 实际创建出的 tokenizer 实例（中英双语）。
 /// Concrete tokenizer instance created by SQLite FTS5 (bilingual).
-#[derive(Debug)]
 struct JiebaTokenizerInstance {
     shared_state: Arc<RwLock<SharedDictionaryState>>,
 }
@@ -151,7 +156,8 @@ struct TokenSpan {
 
 /// 全局数据库词典注册表（中英双语）。
 /// Global shared dictionary registry keyed by logical database identity (bilingual).
-fn shared_dictionary_registry() -> &'static Mutex<HashMap<String, Arc<RwLock<SharedDictionaryState>>>> {
+fn shared_dictionary_registry()
+-> &'static Mutex<HashMap<String, Arc<RwLock<SharedDictionaryState>>>> {
     static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<RwLock<SharedDictionaryState>>>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -184,10 +190,6 @@ pub fn ensure_vulcan_dict_table(connection: &Connection) -> rusqlite::Result<()>
 pub fn ensure_jieba_tokenizer_registered(connection: &Connection) -> rusqlite::Result<()> {
     ensure_vulcan_dict_table(connection)?;
 
-    let db_key = connection_registry_key(connection)?;
-    let shared_state = shared_dictionary_state_for_key(&db_key);
-    refresh_shared_dictionary_state(connection, &shared_state)?;
-
     let connection_handle = sqlite_connection_handle(connection);
     {
         let registered = registered_connection_handles()
@@ -197,6 +199,10 @@ pub fn ensure_jieba_tokenizer_registered(connection: &Connection) -> rusqlite::R
             return Ok(());
         }
     }
+
+    let db_key = connection_registry_key(connection)?;
+    let shared_state = shared_dictionary_state_for_key(&db_key);
+    refresh_shared_dictionary_state(connection, &shared_state)?;
 
     let fts_api = fetch_fts5_api(connection)?;
     let registration_context = Box::new(RegisteredTokenizerContext {
@@ -301,7 +307,10 @@ pub fn remove_custom_word(
     }
 
     let affected_rows = connection.execute(
-        &format!("DELETE FROM {table_name} WHERE word = ?1", table_name = VULCAN_DICT_TABLE),
+        &format!(
+            "DELETE FROM {table_name} WHERE word = ?1",
+            table_name = VULCAN_DICT_TABLE
+        ),
         params![trimmed],
     )?;
     refresh_registered_dictionary(connection)?;
@@ -416,17 +425,20 @@ fn tokenize_with_jieba(
         return Ok(Vec::new());
     }
 
-    let custom_words = if let Some(connection) = connection {
+    let spans = if let Some(connection) = connection {
         ensure_jieba_tokenizer_registered(connection)?;
-        current_custom_words(connection)?
+        let db_key = connection_registry_key(connection)?;
+        let shared_state = shared_dictionary_state_for_key(&db_key);
+        let state = shared_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        jieba_token_spans(text, search_mode, &state.jieba)
     } else {
-        Vec::new()
+        let jieba = Jieba::new();
+        jieba_token_spans(text, search_mode, &jieba)
     };
 
-    Ok(jieba_token_spans(text, search_mode, &custom_words)
-        .into_iter()
-        .map(|span| span.token)
-        .collect())
+    Ok(spans.into_iter().map(|span| span.token).collect())
 }
 
 /// 构造安全的 FTS MATCH 表达式（中英双语）。
@@ -440,18 +452,6 @@ fn build_fts_query(tokens: &[String], search_mode: bool) -> String {
         .join(if search_mode { " OR " } else { " " })
 }
 
-/// 获取当前连接对应的共享自定义词快照（中英双语）。
-/// Fetch the current shared custom word snapshot for the connection (bilingual).
-fn current_custom_words(connection: &Connection) -> rusqlite::Result<Vec<CustomWordEntry>> {
-    let db_key = connection_registry_key(connection)?;
-    let shared_state = shared_dictionary_state_for_key(&db_key);
-    Ok(shared_state
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .custom_words
-        .clone())
-}
-
 /// 刷新当前数据库的共享词典状态（中英双语）。
 /// Refresh the shared dictionary state for the current database (bilingual).
 fn refresh_registered_dictionary(connection: &Connection) -> rusqlite::Result<()> {
@@ -462,9 +462,7 @@ fn refresh_registered_dictionary(connection: &Connection) -> rusqlite::Result<()
 
 /// 获取或创建指定数据库键的共享状态（中英双语）。
 /// Get or create the shared state for a database registry key (bilingual).
-fn shared_dictionary_state_for_key(
-    db_key: &str,
-) -> Arc<RwLock<SharedDictionaryState>> {
+fn shared_dictionary_state_for_key(db_key: &str) -> Arc<RwLock<SharedDictionaryState>> {
     let mut registry = shared_dictionary_registry()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -481,10 +479,14 @@ fn refresh_shared_dictionary_state(
     shared_state: &Arc<RwLock<SharedDictionaryState>>,
 ) -> rusqlite::Result<()> {
     let custom_words = load_custom_words(connection)?;
+    let mut jieba = Jieba::new();
+    for entry in &custom_words {
+        jieba.add_word(&entry.word, Some(entry.weight), None);
+    }
     let mut guard = shared_state
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    guard.custom_words = custom_words;
+    guard.jieba = jieba;
     Ok(())
 }
 
@@ -509,7 +511,11 @@ fn sqlite_connection_handle(connection: &Connection) -> usize {
 /// Fetch the FTS5 API pointer from the current SQLite connection (bilingual).
 fn fetch_fts5_api(connection: &Connection) -> rusqlite::Result<*mut fts5_api> {
     let p_ret: *mut fts5_api = ptr::null_mut();
-    let ptr_arg = ToSqlOutput::Pointer((&p_ret as *const *mut fts5_api as _, SQLITE_FTS5_API_PTR_TYPE, None));
+    let ptr_arg = ToSqlOutput::Pointer((
+        &p_ret as *const *mut fts5_api as _,
+        SQLITE_FTS5_API_PTR_TYPE,
+        None,
+    ));
     connection.query_row("SELECT fts5(?)", [ptr_arg], |_| Ok(()))?;
     if p_ret.is_null() {
         return Err(rusqlite::Error::SqliteFailure(
@@ -522,18 +528,9 @@ fn fetch_fts5_api(connection: &Connection) -> rusqlite::Result<*mut fts5_api> {
 
 /// 使用当前共享词典生成带 UTF-8 偏移量的 Jieba 切分结果（中英双语）。
 /// Produce Jieba token spans with UTF-8 byte offsets using current shared dictionary state (bilingual).
-fn jieba_token_spans(
-    text: &str,
-    search_mode: bool,
-    custom_words: &[CustomWordEntry],
-) -> Vec<TokenSpan> {
+fn jieba_token_spans(text: &str, search_mode: bool, jieba: &Jieba) -> Vec<TokenSpan> {
     if text.is_empty() {
         return Vec::new();
-    }
-
-    let mut jieba = Jieba::new();
-    for entry in custom_words {
-        jieba.add_word(&entry.word, Some(entry.weight), None);
     }
 
     let char_to_byte = unicode_char_to_byte_offsets(text);
@@ -565,7 +562,10 @@ fn jieba_token_spans(
 /// 预计算 Unicode 字符索引到 UTF-8 字节索引的映射（中英双语）。
 /// Precompute a mapping from Unicode character indices to UTF-8 byte indices (bilingual).
 fn unicode_char_to_byte_offsets(text: &str) -> Vec<usize> {
-    let mut offsets = text.char_indices().map(|(index, _)| index).collect::<Vec<_>>();
+    let mut offsets = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
     offsets.push(text.len());
     offsets
 }
@@ -662,8 +662,9 @@ unsafe extern "C" fn sqlite_jieba_tokenizer_tokenize(
         return ffi::SQLITE_ERROR;
     };
 
-    let search_mode = (flags & ffi::FTS5_TOKENIZE_QUERY) != 0 || (flags & ffi::FTS5_TOKENIZE_AUX) != 0;
-    let spans = jieba_token_spans(text, search_mode, &shared_state.custom_words);
+    let search_mode =
+        (flags & ffi::FTS5_TOKENIZE_QUERY) != 0 || (flags & ffi::FTS5_TOKENIZE_AUX) != 0;
+    let spans = jieba_token_spans(text, search_mode, &shared_state.jieba);
     for span in spans {
         let token_bytes = span.token.as_bytes();
         let rc = unsafe {
@@ -687,6 +688,7 @@ unsafe extern "C" fn sqlite_jieba_tokenizer_tokenize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
 
     /// 验证伴生词典表热更新与 Jieba 分词协同工作（中英双语）。
     /// Verify companion dictionary hot updates cooperate with Jieba segmentation (bilingual).
@@ -695,15 +697,23 @@ mod tests {
         let connection = Connection::open_in_memory()?;
         ensure_jieba_tokenizer_registered(&connection)?;
 
-        let before =
-            tokenize_text(Some(&connection), TokenizerMode::Jieba, "市民田-女士急匆匆", false)?;
+        let before = tokenize_text(
+            Some(&connection),
+            TokenizerMode::Jieba,
+            "市民田-女士急匆匆",
+            false,
+        )?;
         assert!(!before.tokens.iter().any(|token| token == "田-女士"));
 
         let mutation = upsert_custom_word(&connection, "田-女士", 42)?;
         assert!(mutation.success);
 
-        let after =
-            tokenize_text(Some(&connection), TokenizerMode::Jieba, "市民田-女士急匆匆", false)?;
+        let after = tokenize_text(
+            Some(&connection),
+            TokenizerMode::Jieba,
+            "市民田-女士急匆匆",
+            false,
+        )?;
         assert!(after.tokens.iter().any(|token| token == "田-女士"));
 
         let removed = remove_custom_word(&connection, "田-女士")?;
@@ -744,6 +754,38 @@ mod tests {
         )?;
         assert_eq!(count, 1);
 
+        Ok(())
+    }
+
+    /// 验证批量 FTS 写入复用已注册的 Jieba 实例，而不会逐行重新加载内置词典（中英双语）。
+    /// Verify bulk FTS writes reuse the registered Jieba instance instead of reloading its dictionary per row (bilingual).
+    #[test]
+    fn sqlite_fts_jieba_bulk_insert_reuses_cached_engine() -> rusqlite::Result<()> {
+        let connection = Connection::open_in_memory()?;
+        ensure_jieba_tokenizer_registered(&connection)?;
+        connection.execute_batch(
+            "CREATE VIRTUAL TABLE bulk_fts USING fts5(content, tokenize='jieba');",
+        )?;
+
+        let started_at = Instant::now();
+        connection.execute_batch(
+            r#"WITH RECURSIVE rows(value) AS (
+                   SELECT 1
+                   UNION ALL
+                   SELECT value + 1 FROM rows WHERE value < 2000
+               )
+               INSERT INTO bulk_fts(content)
+               SELECT printf('角色等级提升到第%d级后获得新的技能与装备', value) FROM rows;"#,
+        )?;
+        let elapsed = started_at.elapsed();
+        let indexed_rows: i64 =
+            connection.query_row("SELECT COUNT(*) FROM bulk_fts;", [], |row| row.get(0))?;
+
+        assert_eq!(indexed_rows, 2000);
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "bulk Jieba FTS insertion rebuilt the engine per row: {elapsed:?}"
+        );
         Ok(())
     }
 }

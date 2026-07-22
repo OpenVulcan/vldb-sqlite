@@ -27,7 +27,7 @@ Or add it manually:
 
 ```toml
 [dependencies]
-vldb-sqlite = "0.1.5"
+vldb-sqlite = "0.1.6"
 ```
 
 ## Run the Gateway
