@@ -161,7 +161,10 @@ impl SqliteRuntime {
 
     /// 打开或复用指定路径的数据库句柄。
     /// Open or reuse a database handle for the specified path.
-    pub fn open_database(&self, db_path: impl AsRef<str>) -> Result<Arc<SqliteDatabaseHandle>, BoxError> {
+    pub fn open_database(
+        &self,
+        db_path: impl AsRef<str>,
+    ) -> Result<Arc<SqliteDatabaseHandle>, BoxError> {
         self.open_database_with_options(db_path, self.default_options.clone())
     }
 
@@ -172,10 +175,8 @@ impl SqliteRuntime {
         db_path: impl AsRef<str>,
         options: SqliteOpenOptions,
     ) -> Result<Arc<SqliteDatabaseHandle>, BoxError> {
-        let normalized = normalize_db_path(
-            db_path.as_ref(),
-            options.hardening.allow_uri_filenames,
-        )?;
+        let normalized =
+            normalize_db_path(db_path.as_ref(), options.hardening.allow_uri_filenames)?;
 
         let mut guard = self
             .databases
@@ -245,12 +246,12 @@ impl SqliteDatabaseHandle {
     /// 创建单库句柄。
     /// Create a single database handle.
     pub fn new(db_path: String, options: SqliteOpenOptions) -> Result<Self, BoxError> {
-        if !is_special_db_path(&db_path) && !looks_like_sqlite_uri(&db_path) {
-            if let Some(parent) = Path::new(&db_path).parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
-            }
+        if !is_special_db_path(&db_path)
+            && !looks_like_sqlite_uri(&db_path)
+            && let Some(parent) = Path::new(&db_path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
 
         let file_lock = if options.hardening.enforce_db_file_lock && !is_special_db_path(&db_path) {

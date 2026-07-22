@@ -13,8 +13,8 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 默认 Arrow IPC chunk 大小，供流式查询在内存与下游消费之间折中。
 /// Default Arrow IPC chunk size used to balance memory and downstream consumption.
@@ -126,15 +126,12 @@ impl QueryStreamResult {
     pub fn read_chunk(&self, index: usize) -> Result<Vec<u8>, SqlExecCoreError> {
         let descriptor = self.chunks_descriptor(index)?;
         let mut file = File::open(&self.storage.file_path).map_err(|error| {
-            SqlExecCoreError::Internal(format!(
-                "open query stream spool file failed: {error}"
-            ))
+            SqlExecCoreError::Internal(format!("open query stream spool file failed: {error}"))
         })?;
-        file.seek(SeekFrom::Start(descriptor.offset)).map_err(|error| {
-            SqlExecCoreError::Internal(format!(
-                "seek query stream spool file failed: {error}"
-            ))
-        })?;
+        file.seek(SeekFrom::Start(descriptor.offset))
+            .map_err(|error| {
+                SqlExecCoreError::Internal(format!("seek query stream spool file failed: {error}"))
+            })?;
         let chunk_len = usize::try_from(descriptor.len).map_err(|_| {
             SqlExecCoreError::Internal(
                 "query stream chunk length exceeds usize / QueryStream chunk 长度超过 usize"
@@ -143,16 +140,17 @@ impl QueryStreamResult {
         })?;
         let mut chunk = vec![0_u8; chunk_len];
         file.read_exact(&mut chunk).map_err(|error| {
-            SqlExecCoreError::Internal(format!(
-                "read query stream spool chunk failed: {error}"
-            ))
+            SqlExecCoreError::Internal(format!("read query stream spool chunk failed: {error}"))
         })?;
         Ok(chunk)
     }
 
     /// 返回指定下标的 chunk 描述信息。
     /// Return the chunk descriptor at the specified index.
-    fn chunks_descriptor(&self, index: usize) -> Result<QueryStreamChunkDescriptor, SqlExecCoreError> {
+    fn chunks_descriptor(
+        &self,
+        index: usize,
+    ) -> Result<QueryStreamChunkDescriptor, SqlExecCoreError> {
         self.storage.chunks.get(index).copied().ok_or_else(|| {
             SqlExecCoreError::InvalidArgument(
                 "chunk index out of bounds / chunk 下标越界".to_string(),
@@ -338,10 +336,11 @@ pub fn execute_script(
     }
 
     if bound_values.is_empty() {
-        conn.execute_batch(sql).map_err(|error| SqlExecCoreError::Sqlite {
-            prefix: "sqlite execute_batch failed",
-            error,
-        })?;
+        conn.execute_batch(sql)
+            .map_err(|error| SqlExecCoreError::Sqlite {
+                prefix: "sqlite execute_batch failed",
+                error,
+            })?;
 
         return Ok(ExecuteScriptResult {
             success: true,
@@ -357,17 +356,19 @@ pub fn execute_script(
         ));
     }
 
-    let mut stmt = conn.prepare(sql).map_err(|error| SqlExecCoreError::Sqlite {
-        prefix: "sqlite prepare failed",
-        error,
-    })?;
-    let params = bind_values_as_params(bound_values);
-    let rows_changed = stmt
-        .execute(params.as_slice())
+    let mut stmt = conn
+        .prepare(sql)
         .map_err(|error| SqlExecCoreError::Sqlite {
-            prefix: "sqlite execute failed",
+            prefix: "sqlite prepare failed",
             error,
         })?;
+    let params = bind_values_as_params(bound_values);
+    let rows_changed =
+        stmt.execute(params.as_slice())
+            .map_err(|error| SqlExecCoreError::Sqlite {
+                prefix: "sqlite execute failed",
+                error,
+            })?;
 
     Ok(ExecuteScriptResult {
         success: true,
@@ -407,20 +408,22 @@ pub fn execute_batch(
         })?;
 
     let batch_result = (|| -> Result<ExecuteBatchResult, SqlExecCoreError> {
-        let mut stmt = conn.prepare(sql).map_err(|error| SqlExecCoreError::Sqlite {
-            prefix: "sqlite prepare failed",
-            error,
-        })?;
+        let mut stmt = conn
+            .prepare(sql)
+            .map_err(|error| SqlExecCoreError::Sqlite {
+                prefix: "sqlite prepare failed",
+                error,
+            })?;
 
         let mut rows_changed = 0_i64;
         for params in batch_params {
             let params = bind_values_as_params(params);
-            let changed = stmt
-                .execute(params.as_slice())
-                .map_err(|error| SqlExecCoreError::Sqlite {
-                    prefix: "sqlite execute failed",
-                    error,
-                })?;
+            let changed =
+                stmt.execute(params.as_slice())
+                    .map_err(|error| SqlExecCoreError::Sqlite {
+                        prefix: "sqlite execute failed",
+                        error,
+                    })?;
             rows_changed = rows_changed.saturating_add(i64::try_from(changed).unwrap_or(i64::MAX));
         }
 
@@ -468,20 +471,24 @@ pub fn query_json(
         ));
     }
 
-    let mut stmt = conn.prepare(sql).map_err(|error| SqlExecCoreError::Sqlite {
-        prefix: "sqlite prepare failed",
-        error,
-    })?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|error| SqlExecCoreError::Sqlite {
+            prefix: "sqlite prepare failed",
+            error,
+        })?;
     let column_names = stmt
         .column_names()
         .into_iter()
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
     let params = bind_values_as_params(bound_values);
-    let mut rows = stmt.query(params.as_slice()).map_err(|error| SqlExecCoreError::Sqlite {
-        prefix: "sqlite query failed",
-        error,
-    })?;
+    let mut rows = stmt
+        .query(params.as_slice())
+        .map_err(|error| SqlExecCoreError::Sqlite {
+            prefix: "sqlite query failed",
+            error,
+        })?;
 
     let mut json_rows = Vec::<JsonValue>::new();
     while let Some(row) = rows.next().map_err(|error| SqlExecCoreError::Sqlite {
@@ -551,10 +558,12 @@ pub fn query_stream_with_writer<W: QueryStreamChunkWriter>(
         ));
     }
 
-    let mut stmt = conn.prepare(sql).map_err(|error| SqlExecCoreError::Sqlite {
-        prefix: "sqlite prepare failed",
-        error,
-    })?;
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|error| SqlExecCoreError::Sqlite {
+            prefix: "sqlite prepare failed",
+            error,
+        })?;
     let columns = stmt.columns();
     let column_names = columns
         .iter()
@@ -565,10 +574,12 @@ pub fn query_stream_with_writer<W: QueryStreamChunkWriter>(
         .map(|column| column.decl_type().map(|value| value.to_string()))
         .collect::<Vec<_>>();
     let params = bind_values_as_params(bound_values);
-    let mut rows = stmt.query(params.as_slice()).map_err(|error| SqlExecCoreError::Sqlite {
-        prefix: "sqlite query failed",
-        error,
-    })?;
+    let mut rows = stmt
+        .query(params.as_slice())
+        .map_err(|error| SqlExecCoreError::Sqlite {
+            prefix: "sqlite query failed",
+            error,
+        })?;
 
     let mut chunk_writer = Some(writer);
     let mut ipc_writer: Option<StreamWriter<W>> = None;
@@ -586,12 +597,12 @@ pub fn query_stream_with_writer<W: QueryStreamChunkWriter>(
                 Some(row) => {
                     let mut values = Vec::with_capacity(column_names.len());
                     for index in 0..column_names.len() {
-                        let value = row
-                            .get_ref(index)
-                            .map_err(|error| SqlExecCoreError::Sqlite {
-                                prefix: "sqlite value access failed",
-                                error,
-                            })?;
+                        let value =
+                            row.get_ref(index)
+                                .map_err(|error| SqlExecCoreError::Sqlite {
+                                    prefix: "sqlite value access failed",
+                                    error,
+                                })?;
                         values.push(SqliteValue::try_from(value).map_err(|error| {
                             SqlExecCoreError::Sqlite {
                                 prefix: "sqlite value conversion failed while materializing rows",
@@ -636,12 +647,13 @@ pub fn query_stream_with_writer<W: QueryStreamChunkWriter>(
                     .collect::<Vec<_>>(),
             )));
 
-            let writer = StreamWriter::try_new(chunk_writer.take().unwrap(), schema.as_ref().unwrap())
-                .map_err(|error| {
-                SqlExecCoreError::Internal(format!(
-                    "arrow stream header write failed: {error}"
-                ))
-            })?;
+            let writer =
+                StreamWriter::try_new(chunk_writer.take().unwrap(), schema.as_ref().unwrap())
+                    .map_err(|error| {
+                        SqlExecCoreError::Internal(format!(
+                            "arrow stream header write failed: {error}"
+                        ))
+                    })?;
             ipc_writer = Some(writer);
         }
 
@@ -676,14 +688,21 @@ pub fn query_stream_with_writer<W: QueryStreamChunkWriter>(
         let total_bytes = writer.emitted_total_bytes();
         (writer, chunk_count, total_bytes)
     } else {
-        (chunk_writer.take().expect("writer should remain available"), 0, 0)
+        (
+            chunk_writer.take().expect("writer should remain available"),
+            0,
+            0,
+        )
     };
 
-    Ok((writer, QueryStreamMetrics {
-        row_count: u64::try_from(total_rows).unwrap_or(u64::MAX),
-        chunk_count,
-        total_bytes,
-    }))
+    Ok((
+        writer,
+        QueryStreamMetrics {
+            row_count: u64::try_from(total_rows).unwrap_or(u64::MAX),
+            chunk_count,
+            total_bytes,
+        },
+    ))
 }
 
 /// 检测 SQL 是否包含多条语句。
@@ -1058,9 +1077,7 @@ impl TempFileChunkWriter {
         let chunk_size = target_chunk_size.max(64 * 1024);
         let file_path = make_query_stream_spool_path();
         let file = File::create(&file_path).map_err(|error| {
-            SqlExecCoreError::Internal(format!(
-                "create query stream spool file failed: {error}"
-            ))
+            SqlExecCoreError::Internal(format!("create query stream spool file failed: {error}"))
         })?;
         Ok(Self {
             file,
@@ -1182,8 +1199,8 @@ impl Write for ChunkCollector {
 mod tests {
     use super::{
         DEFAULT_IPC_CHUNK_BYTES, ExecuteBatchResult, ExecuteScriptResult, count_sql_statements,
-        has_multiple_sql_statements, json_param_to_sqlite_value, parse_legacy_params_json, query_json,
-        query_stream,
+        has_multiple_sql_statements, json_param_to_sqlite_value, parse_legacy_params_json,
+        query_json, query_stream,
     };
     use rusqlite::Connection;
     use rusqlite::types::Value as SqliteValue;
@@ -1218,7 +1235,8 @@ mod tests {
 
     #[test]
     fn json_param_to_sqlite_value_rejects_nested_values() {
-        let err = json_param_to_sqlite_value(json!({"nested":true})).expect_err("nested JSON should fail");
+        let err = json_param_to_sqlite_value(json!({"nested":true}))
+            .expect_err("nested JSON should fail");
         assert!(err.to_string().contains("scalar JSON values"));
     }
 
@@ -1279,8 +1297,8 @@ mod tests {
             batch,
             ExecuteBatchResult {
                 success: true,
-                message:
-                    "batch executed successfully (statements_executed=2 rows_changed=2)".to_string(),
+                message: "batch executed successfully (statements_executed=2 rows_changed=2)"
+                    .to_string(),
                 rows_changed: 2,
                 last_insert_rowid: 2,
                 statements_executed: 2,
@@ -1305,7 +1323,9 @@ mod tests {
         .expect("query_stream should succeed");
         assert_eq!(result.row_count, 1);
         assert!(result.chunk_count >= 1);
-        let first_chunk = result.read_chunk(0).expect("first chunk should be readable");
+        let first_chunk = result
+            .read_chunk(0)
+            .expect("first chunk should be readable");
         assert!(!first_chunk.is_empty());
     }
 

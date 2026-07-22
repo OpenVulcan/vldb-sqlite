@@ -267,7 +267,10 @@ pub fn upsert_fts_document(
 
     let mut affected_rows = 0_u64;
     affected_rows += connection.execute(
-        &format!("DELETE FROM {index_name} WHERE id = ?1", index_name = quoted_index_name),
+        &format!(
+            "DELETE FROM {index_name} WHERE id = ?1",
+            index_name = quoted_index_name
+        ),
         params![id],
     )? as u64;
     affected_rows += connection.execute(
@@ -296,7 +299,10 @@ pub fn delete_fts_document(
     let index_name = sanitize_index_name(index_name)?;
     let quoted_index_name = quote_identifier(&index_name);
     let affected_rows = connection.execute(
-        &format!("DELETE FROM {index_name} WHERE id = ?1", index_name = quoted_index_name),
+        &format!(
+            "DELETE FROM {index_name} WHERE id = ?1",
+            index_name = quoted_index_name
+        ),
         params![id],
     )? as u64;
 

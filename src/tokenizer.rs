@@ -8,7 +8,7 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::ptr;
 use std::slice;
 use std::str;
-use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, Weak};
 
 /// 伴生系统词典表名（中英双语）。
 /// System companion dictionary table name (bilingual).
@@ -121,13 +121,13 @@ pub struct ListCustomWordsResult {
 /// 共享词典状态（中英双语）。
 /// Shared dictionary state reused by all SQLite connections for the same database (bilingual).
 struct SharedDictionaryState {
-    jieba: Jieba,
+    jieba: Arc<Jieba>,
 }
 
 impl Default for SharedDictionaryState {
     fn default() -> Self {
         Self {
-            jieba: Jieba::new(),
+            jieba: Arc::clone(default_jieba()),
         }
     }
 }
@@ -154,11 +154,18 @@ struct TokenSpan {
     end_byte: usize,
 }
 
-/// 全局数据库词典注册表（中英双语）。
-/// Global shared dictionary registry keyed by logical database identity (bilingual).
+/// 进程级默认 Jieba 实例（中英双语）。
+/// Process-wide default Jieba instance shared by databases without custom words (bilingual).
+fn default_jieba() -> &'static Arc<Jieba> {
+    static DEFAULT_JIEBA: OnceLock<Arc<Jieba>> = OnceLock::new();
+    DEFAULT_JIEBA.get_or_init(|| Arc::new(Jieba::new()))
+}
+
+/// 全局数据库词典弱引用注册表（中英双语）。
+/// Global weak dictionary registry keyed by logical database identity (bilingual).
 fn shared_dictionary_registry()
--> &'static Mutex<HashMap<String, Arc<RwLock<SharedDictionaryState>>>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<RwLock<SharedDictionaryState>>>>> =
+-> &'static Mutex<HashMap<String, Weak<RwLock<SharedDictionaryState>>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, Weak<RwLock<SharedDictionaryState>>>>> =
         OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -425,18 +432,18 @@ fn tokenize_with_jieba(
         return Ok(Vec::new());
     }
 
-    let spans = if let Some(connection) = connection {
+    let jieba = if let Some(connection) = connection {
         ensure_jieba_tokenizer_registered(connection)?;
         let db_key = connection_registry_key(connection)?;
         let shared_state = shared_dictionary_state_for_key(&db_key);
         let state = shared_state
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        jieba_token_spans(text, search_mode, &state.jieba)
+        Arc::clone(&state.jieba)
     } else {
-        let jieba = Jieba::new();
-        jieba_token_spans(text, search_mode, &jieba)
+        Arc::clone(default_jieba())
     };
+    let spans = jieba_token_spans(text, search_mode, jieba.as_ref());
 
     Ok(spans.into_iter().map(|span| span.token).collect())
 }
@@ -466,10 +473,14 @@ fn shared_dictionary_state_for_key(db_key: &str) -> Arc<RwLock<SharedDictionaryS
     let mut registry = shared_dictionary_registry()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    registry
-        .entry(db_key.to_string())
-        .or_insert_with(|| Arc::new(RwLock::new(SharedDictionaryState::default())))
-        .clone()
+    if let Some(shared_state) = registry.get(db_key).and_then(Weak::upgrade) {
+        return shared_state;
+    }
+
+    registry.retain(|_, shared_state| shared_state.strong_count() > 0);
+    let shared_state = Arc::new(RwLock::new(SharedDictionaryState::default()));
+    registry.insert(db_key.to_string(), Arc::downgrade(&shared_state));
+    shared_state
 }
 
 /// 从 SQLite 伴生表刷新共享状态（中英双语）。
@@ -479,10 +490,15 @@ fn refresh_shared_dictionary_state(
     shared_state: &Arc<RwLock<SharedDictionaryState>>,
 ) -> rusqlite::Result<()> {
     let custom_words = load_custom_words(connection)?;
-    let mut jieba = Jieba::new();
-    for entry in &custom_words {
-        jieba.add_word(&entry.word, Some(entry.weight), None);
-    }
+    let jieba = if custom_words.is_empty() {
+        Arc::clone(default_jieba())
+    } else {
+        let mut jieba = default_jieba().as_ref().clone();
+        for entry in &custom_words {
+            jieba.add_word(&entry.word, Some(entry.weight), None);
+        }
+        Arc::new(jieba)
+    };
     let mut guard = shared_state
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -652,10 +668,13 @@ unsafe extern "C" fn sqlite_jieba_tokenizer_tokenize(
 
     // SAFETY: SQLite passes the tokenizer pointer created in `sqlite_jieba_tokenizer_create`.
     let tokenizer = unsafe { &*(tokenizer as *const JiebaTokenizerInstance) };
-    let shared_state = tokenizer
-        .shared_state
-        .read()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let jieba = {
+        let shared_state = tokenizer
+            .shared_state
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::clone(&shared_state.jieba)
+    };
     // SAFETY: SQLite supplies `text_ptr` and `text_len` for the duration of this callback.
     let text_bytes = unsafe { slice::from_raw_parts(text_ptr as *const u8, text_len as usize) };
     let Ok(text) = str::from_utf8(text_bytes) else {
@@ -664,7 +683,7 @@ unsafe extern "C" fn sqlite_jieba_tokenizer_tokenize(
 
     let search_mode =
         (flags & ffi::FTS5_TOKENIZE_QUERY) != 0 || (flags & ffi::FTS5_TOKENIZE_AUX) != 0;
-    let spans = jieba_token_spans(text, search_mode, &shared_state.jieba);
+    let spans = jieba_token_spans(text, search_mode, jieba.as_ref());
     for span in spans {
         let token_bytes = span.token.as_bytes();
         let rc = unsafe {
@@ -786,6 +805,54 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "bulk Jieba FTS insertion rebuilt the engine per row: {elapsed:?}"
         );
+        Ok(())
+    }
+
+    /// 验证无自定义词数据库共享同一个进程级默认 Jieba 实例（中英双语）。
+    /// Verify databases without custom words share one process-wide default Jieba instance (bilingual).
+    #[test]
+    fn sqlite_jieba_default_engine_is_shared_across_databases() -> rusqlite::Result<()> {
+        let first_connection = Connection::open_in_memory()?;
+        let second_connection = Connection::open_in_memory()?;
+        ensure_jieba_tokenizer_registered(&first_connection)?;
+        ensure_jieba_tokenizer_registered(&second_connection)?;
+
+        let first_key = connection_registry_key(&first_connection)?;
+        let second_key = connection_registry_key(&second_connection)?;
+        let first_state = shared_dictionary_state_for_key(&first_key);
+        let second_state = shared_dictionary_state_for_key(&second_key);
+        let first_jieba = {
+            let state = first_state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(&state.jieba)
+        };
+        let second_jieba = {
+            let state = second_state
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(&state.jieba)
+        };
+
+        assert!(Arc::ptr_eq(&first_jieba, &second_jieba));
+        assert!(Arc::ptr_eq(&first_jieba, default_jieba()));
+        Ok(())
+    }
+
+    /// 验证最后一个数据库连接关闭后弱引用注册表不会保留 Jieba 状态（中英双语）。
+    /// Verify the weak registry does not retain Jieba state after the final database connection closes (bilingual).
+    #[test]
+    fn sqlite_jieba_database_state_is_released_with_connection() -> rusqlite::Result<()> {
+        let connection = Connection::open_in_memory()?;
+        ensure_jieba_tokenizer_registered(&connection)?;
+        let db_key = connection_registry_key(&connection)?;
+        let shared_state = shared_dictionary_state_for_key(&db_key);
+        let weak_state = Arc::downgrade(&shared_state);
+
+        drop(shared_state);
+        drop(connection);
+
+        assert!(weak_state.upgrade().is_none());
         Ok(())
     }
 }

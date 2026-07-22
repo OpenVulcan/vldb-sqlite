@@ -77,14 +77,14 @@ impl ServiceLogger {
             && let Ok(mut guard) = file_state.lock()
         {
             let current_date = current_log_date();
-            if guard.date_key != current_date {
-                if let Ok(rotated) = open_log_file_state(
+            if guard.date_key != current_date
+                && let Ok(rotated) = open_log_file_state(
                     &self.config.log_dir,
                     &self.config.log_file_name,
                     &current_date,
-                ) {
-                    *guard = rotated;
-                }
+                )
+            {
+                *guard = rotated;
             }
 
             let _ = writeln!(guard.file, "{line}");
@@ -134,11 +134,7 @@ fn unix_millis_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!(
-        "{}.{}",
-        now.as_secs(),
-        format!("{:03}", now.subsec_millis())
-    )
+    format!("{}.{:03}", now.as_secs(), now.subsec_millis())
 }
 
 #[cfg(test)]

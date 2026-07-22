@@ -409,7 +409,7 @@ fn validate_membership(
     field_name: &str,
     allowed_values: &[&str],
 ) -> Result<(), BoxError> {
-    if allowed_values.iter().any(|candidate| *candidate == value) {
+    if allowed_values.contains(&value) {
         Ok(())
     } else {
         Err(invalid_input(format!(

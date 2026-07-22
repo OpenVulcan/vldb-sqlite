@@ -4,8 +4,8 @@ mod fts;
 mod logging;
 #[allow(dead_code)]
 mod runtime;
-mod sql_exec;
 mod service;
+mod sql_exec;
 mod tokenizer;
 
 pub mod pb {

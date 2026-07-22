@@ -15,16 +15,15 @@ use crate::pb::{
     TokenizerMode as ProtoTokenizerMode, UpsertCustomWordRequest, UpsertFtsDocumentRequest,
 };
 use crate::runtime::{
-    SqliteHardeningOptions, SqliteOpenOptions, SqlitePragmaOptions, apply_sqlite_connection_pragmas,
-    build_sqlite_open_flags, open_sqlite_connection,
+    SqliteHardeningOptions, SqliteOpenOptions, SqlitePragmaOptions,
+    apply_sqlite_connection_pragmas, build_sqlite_open_flags, open_sqlite_connection,
 };
 use crate::sql_exec::{
     DEFAULT_IPC_CHUNK_BYTES, QueryStreamChunkWriter, QueryStreamMetrics, SqlExecCoreError,
-    execute_batch as execute_batch_core,
-    execute_script as execute_script_core,
+    execute_batch as execute_batch_core, execute_script as execute_script_core,
     parse_batch_params as parse_batch_params_core,
-    parse_request_params as parse_request_params_core,
-    query_json as query_json_core, query_stream_with_writer as query_stream_with_writer_core,
+    parse_request_params as parse_request_params_core, query_json as query_json_core,
+    query_stream_with_writer as query_stream_with_writer_core,
 };
 use crate::tokenizer::{
     TokenizerMode, list_custom_words, remove_custom_word, tokenize_text, upsert_custom_word,
@@ -186,7 +185,12 @@ impl GrpcChunkWriter {
             .blocking_send(Ok(QueryResponse {
                 arrow_ipc_chunk: Bytes::from(chunk),
             }))
-            .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, format!("gRPC stream closed: {error}")))
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    format!("gRPC stream closed: {error}"),
+                )
+            })
     }
 }
 
@@ -573,11 +577,12 @@ impl SqliteService for SqliteGrpcService {
             .await
             .inspect_err(|status| log_request_failed(&context, status))?;
         let worker_context = context.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            run_tokenize_text(worker_context, lease, req)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("tokenize_text worker join failed: {err}")))??;
+        let response =
+            tokio::task::spawn_blocking(move || run_tokenize_text(worker_context, lease, req))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("tokenize_text worker join failed: {err}"))
+                })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -606,11 +611,12 @@ impl SqliteService for SqliteGrpcService {
             .await
             .inspect_err(|status| log_request_failed(&context, status))?;
         let worker_context = context.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            run_upsert_custom_word(worker_context, lease, req)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("upsert_custom_word worker join failed: {err}")))??;
+        let response =
+            tokio::task::spawn_blocking(move || run_upsert_custom_word(worker_context, lease, req))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("upsert_custom_word worker join failed: {err}"))
+                })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -639,11 +645,12 @@ impl SqliteService for SqliteGrpcService {
             .await
             .inspect_err(|status| log_request_failed(&context, status))?;
         let worker_context = context.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            run_remove_custom_word(worker_context, lease, req)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("remove_custom_word worker join failed: {err}")))??;
+        let response =
+            tokio::task::spawn_blocking(move || run_remove_custom_word(worker_context, lease, req))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("remove_custom_word worker join failed: {err}"))
+                })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -667,11 +674,12 @@ impl SqliteService for SqliteGrpcService {
             .await
             .inspect_err(|status| log_request_failed(&context, status))?;
         let worker_context = context.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            run_list_custom_words(worker_context, lease, req)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("list_custom_words worker join failed: {err}")))??;
+        let response =
+            tokio::task::spawn_blocking(move || run_list_custom_words(worker_context, lease, req))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("list_custom_words worker join failed: {err}"))
+                })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -700,11 +708,12 @@ impl SqliteService for SqliteGrpcService {
             .await
             .inspect_err(|status| log_request_failed(&context, status))?;
         let worker_context = context.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            run_ensure_fts_index(worker_context, lease, req)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("ensure_fts_index worker join failed: {err}")))??;
+        let response =
+            tokio::task::spawn_blocking(move || run_ensure_fts_index(worker_context, lease, req))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("ensure_fts_index worker join failed: {err}"))
+                })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -733,11 +742,12 @@ impl SqliteService for SqliteGrpcService {
             .await
             .inspect_err(|status| log_request_failed(&context, status))?;
         let worker_context = context.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            run_rebuild_fts_index(worker_context, lease, req)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("rebuild_fts_index worker join failed: {err}")))??;
+        let response =
+            tokio::task::spawn_blocking(move || run_rebuild_fts_index(worker_context, lease, req))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("rebuild_fts_index worker join failed: {err}"))
+                })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -774,7 +784,9 @@ impl SqliteService for SqliteGrpcService {
             run_upsert_fts_document(worker_context, lease, req)
         })
         .await
-        .map_err(|err| Status::internal(format!("upsert_fts_document worker join failed: {err}")))??;
+        .map_err(|err| {
+            Status::internal(format!("upsert_fts_document worker join failed: {err}"))
+        })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -811,7 +823,9 @@ impl SqliteService for SqliteGrpcService {
             run_delete_fts_document(worker_context, lease, req)
         })
         .await
-        .map_err(|err| Status::internal(format!("delete_fts_document worker join failed: {err}")))??;
+        .map_err(|err| {
+            Status::internal(format!("delete_fts_document worker join failed: {err}"))
+        })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -844,11 +858,12 @@ impl SqliteService for SqliteGrpcService {
             .await
             .inspect_err(|status| log_request_failed(&context, status))?;
         let worker_context = context.clone();
-        let response = tokio::task::spawn_blocking(move || {
-            run_search_fts(worker_context, lease, req)
-        })
-        .await
-        .map_err(|err| Status::internal(format!("search_fts worker join failed: {err}")))??;
+        let response =
+            tokio::task::spawn_blocking(move || run_search_fts(worker_context, lease, req))
+                .await
+                .map_err(|err| {
+                    Status::internal(format!("search_fts worker join failed: {err}"))
+                })??;
 
         Ok(response_with_default_metadata(response))
     }
@@ -1046,8 +1061,8 @@ fn run_tokenize_text(
     let conn = lease.connection_mut();
     let result = (|| -> Result<TokenizeTextResponse, RequestFailure> {
         set_request_stage(&context, "tokenizing_text");
-        let tokenizer_mode = tokenizer_mode_from_proto(request.tokenizer_mode)
-            .map_err(RequestFailure::Status)?;
+        let tokenizer_mode =
+            tokenizer_mode_from_proto(request.tokenizer_mode).map_err(RequestFailure::Status)?;
         let output = tokenize_text(
             Some(conn),
             tokenizer_mode,
@@ -1106,7 +1121,10 @@ fn run_upsert_custom_word(
     match &result {
         Ok(response) => log_request_succeeded(
             &context,
-            format!("custom word updated (affected_rows={})", response.affected_rows),
+            format!(
+                "custom word updated (affected_rows={})",
+                response.affected_rows
+            ),
         ),
         Err(status) => log_request_failed(&context, status),
     }
@@ -1136,7 +1154,10 @@ fn run_remove_custom_word(
     match &result {
         Ok(response) => log_request_succeeded(
             &context,
-            format!("custom word removed (affected_rows={})", response.affected_rows),
+            format!(
+                "custom word removed (affected_rows={})",
+                response.affected_rows
+            ),
         ),
         Err(status) => log_request_failed(&context, status),
     }
@@ -1422,12 +1443,8 @@ fn run_query_streaming(
         let bound_values = parse_request_params_core(&params, &params_json)?;
         set_request_stage(&context, "executing_query");
         let grpc_writer = GrpcChunkWriter::new(tx, DEFAULT_IPC_CHUNK_BYTES);
-        let (_writer, metrics) = query_stream_with_writer_core(
-            conn,
-            &sql,
-            &bound_values,
-            grpc_writer,
-        )?;
+        let (_writer, metrics) =
+            query_stream_with_writer_core(conn, &sql, &bound_values, grpc_writer)?;
         set_request_stage(&context, "streaming_batches");
         Ok(metrics)
     })();
@@ -1988,11 +2005,14 @@ fn maybe_log_slow_query(
         return;
     }
 
-    let sql_text = format_sql_for_log(context, if context.slow_query_full_sql_enabled {
-        &context.sql_full
-    } else {
-        &context.sql_preview
-    });
+    let sql_text = format_sql_for_log(
+        context,
+        if context.slow_query_full_sql_enabled {
+            &context.sql_full
+        } else {
+            &context.sql_preview
+        },
+    );
 
     context.logger.log(
         "slow_query",
@@ -2091,8 +2111,10 @@ mod tests {
     #[test]
     fn apply_connection_pragmas_supports_default_profile() {
         let conn = Connection::open_in_memory().expect("open sqlite connection");
-        let mut config = Config::default();
-        config.db_path = ":memory:".to_string();
+        let config = Config {
+            db_path: ":memory:".to_string(),
+            ..Config::default()
+        };
 
         apply_connection_pragmas(&conn, &config).expect("apply sqlite pragmas");
 
@@ -2116,8 +2138,10 @@ mod tests {
         let db_path = unique_test_db_path("wal");
         let _cleanup = TempSqliteFiles::new(&db_path);
         let conn = Connection::open(&db_path).expect("open sqlite file database");
-        let mut config = Config::default();
-        config.db_path = db_path.to_string_lossy().to_string();
+        let config = Config {
+            db_path: db_path.to_string_lossy().to_string(),
+            ..Config::default()
+        };
 
         apply_connection_pragmas(&conn, &config).expect("apply sqlite pragmas");
 
@@ -2202,9 +2226,11 @@ mod tests {
 
     #[test]
     fn in_memory_database_forces_single_connection_pool() {
-        let mut config = Config::default();
-        config.db_path = ":memory:".to_string();
-        config.connection_pool_size = 8;
+        let config = Config {
+            db_path: ":memory:".to_string(),
+            connection_pool_size: 8,
+            ..Config::default()
+        };
 
         assert_eq!(effective_connection_pool_size(&config), 1);
     }
@@ -2248,18 +2274,30 @@ mod tests {
     #[test]
     fn has_multiple_sql_statements_detects_single_statement() {
         assert!(!has_multiple_sql_statements("SELECT * FROM users"));
-        assert!(!has_multiple_sql_statements("SELECT * FROM users WHERE name = 'a;b'"));
-        assert!(!has_multiple_sql_statements("SELECT * FROM users WHERE name = \"a;b\""));
-        assert!(!has_multiple_sql_statements("SELECT * FROM users -- comment; more\nWHERE id = 1"));
-        assert!(!has_multiple_sql_statements("SELECT * FROM users /* comment ; here */ WHERE id = 1"));
-        assert!(!has_multiple_sql_statements("INSERT INTO t VALUES ('hello''world')"));
+        assert!(!has_multiple_sql_statements(
+            "SELECT * FROM users WHERE name = 'a;b'"
+        ));
+        assert!(!has_multiple_sql_statements(
+            "SELECT * FROM users WHERE name = \"a;b\""
+        ));
+        assert!(!has_multiple_sql_statements(
+            "SELECT * FROM users -- comment; more\nWHERE id = 1"
+        ));
+        assert!(!has_multiple_sql_statements(
+            "SELECT * FROM users /* comment ; here */ WHERE id = 1"
+        ));
+        assert!(!has_multiple_sql_statements(
+            "INSERT INTO t VALUES ('hello''world')"
+        ));
     }
 
     #[test]
     fn has_multiple_sql_statements_detects_multiple_statements() {
         assert!(has_multiple_sql_statements("SELECT 1; SELECT 2"));
         assert!(has_multiple_sql_statements("SELECT 1; SELECT 2; SELECT 3"));
-        assert!(has_multiple_sql_statements("INSERT INTO t VALUES (1); DELETE FROM t"));
+        assert!(has_multiple_sql_statements(
+            "INSERT INTO t VALUES (1); DELETE FROM t"
+        ));
     }
 
     #[test]

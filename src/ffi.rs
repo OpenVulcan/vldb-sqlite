@@ -1,5 +1,3 @@
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use crate::fts::{
     delete_fts_document, ensure_fts_index, rebuild_fts_index, search_fts, upsert_fts_document,
 };
@@ -8,15 +6,17 @@ use crate::runtime::{
     SqliteDatabaseHandle, SqliteOpenOptions, SqliteRuntime, open_sqlite_connection,
 };
 use crate::sql_exec::{
-    DEFAULT_IPC_CHUNK_BYTES, QueryJsonResult, QueryStreamResult, SqlExecCoreError,
-    QueryStreamChunkWriter, QueryStreamMetrics, query_stream_with_writer,
-    count_sql_statements, execute_batch as execute_batch_core, execute_script as execute_script_core,
-    parse_legacy_params_json, query_json as query_json_core, query_stream as query_stream_core,
+    DEFAULT_IPC_CHUNK_BYTES, QueryJsonResult, QueryStreamChunkWriter, QueryStreamMetrics,
+    QueryStreamResult, SqlExecCoreError, count_sql_statements, execute_batch as execute_batch_core,
+    execute_script as execute_script_core, parse_legacy_params_json, query_json as query_json_core,
+    query_stream as query_stream_core, query_stream_with_writer,
 };
 use crate::tokenizer::{
     ListCustomWordsResult, TokenizeOutput, TokenizerMode, list_custom_words, remove_custom_word,
     tokenize_text, upsert_custom_word,
 };
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use rusqlite::Connection;
 use rusqlite::types::Value as SqliteValue;
 use serde::{Deserialize, Serialize};
@@ -221,15 +221,13 @@ impl FfiQueryStreamSharedState {
     }
 
     fn wait_for_metrics(&self) -> Result<(u64, u64, u64), String> {
-        let mut guard = self
-            .inner
-            .lock()
-            .map_err(|_| "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string())?;
+        let mut guard = self.inner.lock().map_err(|_| {
+            "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string()
+        })?;
         while !guard.complete {
-            guard = self
-                .ready
-                .wait(guard)
-                .map_err(|_| "failed to wait for query stream completion / 等待 QueryStream 完成失败".to_string())?;
+            guard = self.ready.wait(guard).map_err(|_| {
+                "failed to wait for query stream completion / 等待 QueryStream 完成失败".to_string()
+            })?;
         }
         if let Some(error) = guard.error.clone() {
             return Err(error);
@@ -239,10 +237,9 @@ impl FfiQueryStreamSharedState {
 
     fn read_chunk(&self, index: usize) -> Result<Vec<u8>, String> {
         let (file_path, descriptor) = {
-            let mut guard = self
-                .inner
-                .lock()
-                .map_err(|_| "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string())?;
+            let mut guard = self.inner.lock().map_err(|_| {
+                "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string()
+            })?;
             loop {
                 if let Some(descriptor) = guard.chunk_descriptors.get(index).copied() {
                     break (guard.file_path.clone(), descriptor);
@@ -253,10 +250,10 @@ impl FfiQueryStreamSharedState {
                 if guard.complete {
                     return Err("chunk index out of bounds / chunk 下标越界".to_string());
                 }
-                guard = self
-                    .ready
-                    .wait(guard)
-                    .map_err(|_| "failed to wait for query stream chunk / 等待 QueryStream chunk 失败".to_string())?;
+                guard = self.ready.wait(guard).map_err(|_| {
+                    "failed to wait for query stream chunk / 等待 QueryStream chunk 失败"
+                        .to_string()
+                })?;
             }
         };
 
@@ -264,8 +261,9 @@ impl FfiQueryStreamSharedState {
             .map_err(|error| format!("open query stream spool file failed: {error}"))?;
         file.seek(SeekFrom::Start(descriptor.offset))
             .map_err(|error| format!("seek query stream spool file failed: {error}"))?;
-        let chunk_len = usize::try_from(descriptor.len)
-            .map_err(|_| "query stream chunk length exceeds usize / QueryStream chunk 长度超过 usize".to_string())?;
+        let chunk_len = usize::try_from(descriptor.len).map_err(|_| {
+            "query stream chunk length exceeds usize / QueryStream chunk 长度超过 usize".to_string()
+        })?;
         let mut chunk = vec![0_u8; chunk_len];
         file.read_exact(&mut chunk)
             .map_err(|error| format!("read query stream spool chunk failed: {error}"))?;
@@ -297,13 +295,15 @@ struct FfiStreamingTempFileWriter {
 }
 
 impl FfiStreamingTempFileWriter {
-    fn new(state: Arc<FfiQueryStreamSharedState>, target_chunk_size: usize) -> Result<Self, String> {
+    fn new(
+        state: Arc<FfiQueryStreamSharedState>,
+        target_chunk_size: usize,
+    ) -> Result<Self, String> {
         let chunk_size = target_chunk_size.max(64 * 1024);
         let file_path = {
-            let guard = state
-                .inner
-                .lock()
-                .map_err(|_| "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string())?;
+            let guard = state.inner.lock().map_err(|_| {
+                "failed to lock query stream state / 无法锁定 QueryStream 状态".to_string()
+            })?;
             guard.file_path.clone()
         };
         let file = File::create(&file_path)
@@ -569,13 +569,15 @@ fn last_error_slot() -> &'static Mutex<Option<CString>> {
     LAST_ERROR.get_or_init(|| Mutex::new(None))
 }
 
-fn json_query_stream_registry(
-) -> &'static Mutex<std::collections::HashMap<u64, JsonQueryStreamEntry>> {
+fn json_query_stream_registry()
+-> &'static Mutex<std::collections::HashMap<u64, JsonQueryStreamEntry>> {
     JSON_QUERY_STREAM_CLEANER.get_or_init(|| {
-        thread::spawn(|| loop {
-            thread::sleep(JSON_QUERY_STREAM_CLEANUP_INTERVAL);
-            if let Ok(mut guard) = json_query_stream_registry().lock() {
-                cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
+        thread::spawn(|| {
+            loop {
+                thread::sleep(JSON_QUERY_STREAM_CLEANUP_INTERVAL);
+                if let Ok(mut guard) = json_query_stream_registry().lock() {
+                    cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
+                }
             }
         });
     });
@@ -701,7 +703,9 @@ fn custom_word_list_handle_ref(
     handle: *mut VldbSqliteCustomWordListHandle,
 ) -> Result<&'static VldbSqliteCustomWordListHandle, String> {
     if handle.is_null() {
-        return Err("custom word list handle must not be null / 自定义词列表句柄不能为空".to_string());
+        return Err(
+            "custom word list handle must not be null / 自定义词列表句柄不能为空".to_string(),
+        );
     }
 
     // SAFETY:
@@ -746,7 +750,9 @@ fn query_json_result_handle_ref(
     handle: *mut VldbSqliteQueryJsonResultHandle,
 ) -> Result<&'static VldbSqliteQueryJsonResultHandle, String> {
     if handle.is_null() {
-        return Err("query json result handle must not be null / JSON 查询结果句柄不能为空".to_string());
+        return Err(
+            "query json result handle must not be null / JSON 查询结果句柄不能为空".to_string(),
+        );
     }
 
     // SAFETY:
@@ -859,8 +865,9 @@ fn ffi_value_to_sqlite_value(value: &VldbSqliteFfiValue) -> Result<SqliteValue, 
                 unsafe {
                     std::slice::from_raw_parts(
                         value.bytes_value.data,
-                        usize::try_from(value.bytes_value.len)
-                            .map_err(|_| "bytes length exceeds usize / bytes 长度超过 usize".to_string())?,
+                        usize::try_from(value.bytes_value.len).map_err(|_| {
+                            "bytes length exceeds usize / bytes 长度超过 usize".to_string()
+                        })?,
                     )
                     .to_vec()
                 }
@@ -994,12 +1001,14 @@ fn start_main_ffi_query_stream(
     let worker_state = Arc::clone(&state);
     thread::spawn(move || {
         let result = (|| -> Result<QueryStreamMetrics, String> {
-            let mut connection = database
-                .open_connection()
-                .map_err(|error| format!("failed to open runtime-managed sqlite connection: {error}"))?;
-            let writer = FfiStreamingTempFileWriter::new(Arc::clone(&worker_state), target_chunk_size)?;
-            let (_writer, metrics) = query_stream_with_writer(&mut connection, &sql, &bound_values, writer)
-                .map_err(sql_exec_error_to_string)?;
+            let mut connection = database.open_connection().map_err(|error| {
+                format!("failed to open runtime-managed sqlite connection: {error}")
+            })?;
+            let writer =
+                FfiStreamingTempFileWriter::new(Arc::clone(&worker_state), target_chunk_size)?;
+            let (_writer, metrics) =
+                query_stream_with_writer(&mut connection, &sql, &bound_values, writer)
+                    .map_err(sql_exec_error_to_string)?;
             Ok(metrics)
         })();
 
@@ -1036,9 +1045,9 @@ fn cleanup_json_query_stream_registry_at(
 /// Register a JSON-compat QueryStream result and return its stream-handle ID.
 fn register_json_query_stream(result: QueryStreamResult) -> Result<u64, String> {
     let stream_id = NEXT_JSON_STREAM_ID.fetch_add(1, Ordering::Relaxed);
-    let mut guard = json_query_stream_registry()
-        .lock()
-        .map_err(|_| "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string())?;
+    let mut guard = json_query_stream_registry().lock().map_err(|_| {
+        "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string()
+    })?;
     cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
     guard.insert(
         stream_id,
@@ -1056,13 +1065,13 @@ fn with_json_query_stream<T>(
     stream_id: u64,
     f: impl FnOnce(&QueryStreamResult) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut guard = json_query_stream_registry()
-        .lock()
-        .map_err(|_| "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string())?;
+    let mut guard = json_query_stream_registry().lock().map_err(|_| {
+        "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string()
+    })?;
     cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
-    let entry = guard
-        .get_mut(&stream_id)
-        .ok_or_else(|| format!("query stream handle not found: {stream_id} / QueryStream 句柄不存在"))?;
+    let entry = guard.get_mut(&stream_id).ok_or_else(|| {
+        format!("query stream handle not found: {stream_id} / QueryStream 句柄不存在")
+    })?;
     entry.last_accessed_at = Instant::now();
     f(&entry.result)
 }
@@ -1070,9 +1079,9 @@ fn with_json_query_stream<T>(
 /// 关闭并移除 JSON 兼容层的 QueryStream 结果。
 /// Close and remove a JSON-compat QueryStream result from the registry.
 fn close_json_query_stream(stream_id: u64) -> Result<bool, String> {
-    let mut guard = json_query_stream_registry()
-        .lock()
-        .map_err(|_| "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string())?;
+    let mut guard = json_query_stream_registry().lock().map_err(|_| {
+        "failed to lock JSON query stream registry / 无法锁定 JSON QueryStream 注册表".to_string()
+    })?;
     cleanup_json_query_stream_registry_at(&mut guard, Instant::now());
     Ok(guard.remove(&stream_id).is_some())
 }
@@ -1259,8 +1268,13 @@ pub extern "C" fn vldb_sqlite_library_info_json() -> *mut c_char {
 
 /// 释放由本库分配的 JSON/C 字符串。
 /// Free a JSON/C string allocated by this library.
+///
+/// # Safety
+///
+/// `value` must be null or a live pointer returned by this library and must be freed exactly once.
+/// `value` 必须为空，或为本库返回且仍然有效的指针，并且只能释放一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_string_free(value: *mut c_char) {
+pub unsafe extern "C" fn vldb_sqlite_string_free(value: *mut c_char) {
     if value.is_null() {
         return;
     }
@@ -1312,8 +1326,13 @@ pub extern "C" fn vldb_sqlite_runtime_create_default() -> *mut VldbSqliteRuntime
 
 /// 释放多库 runtime 句柄。
 /// Destroy a multi-database runtime handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_runtime_destroy(handle: *mut VldbSqliteRuntimeHandle) {
+pub unsafe extern "C" fn vldb_sqlite_runtime_destroy(handle: *mut VldbSqliteRuntimeHandle) {
     if handle.is_null() {
         return;
     }
@@ -1384,8 +1403,13 @@ pub extern "C" fn vldb_sqlite_runtime_close_database(
 
 /// 释放数据库句柄。
 /// Destroy a database handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_database_destroy(handle: *mut VldbSqliteDatabaseHandle) {
+pub unsafe extern "C" fn vldb_sqlite_database_destroy(handle: *mut VldbSqliteDatabaseHandle) {
     if handle.is_null() {
         return;
     }
@@ -1563,8 +1587,15 @@ pub extern "C" fn vldb_sqlite_database_query_stream(
 
 /// 释放通用 SQL 执行结果句柄。
 /// Destroy a shared SQL execution-result handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live result handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的结果句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_execute_result_destroy(handle: *mut VldbSqliteExecuteResultHandle) {
+pub unsafe extern "C" fn vldb_sqlite_execute_result_destroy(
+    handle: *mut VldbSqliteExecuteResultHandle,
+) {
     if handle.is_null() {
         return;
     }
@@ -1651,8 +1682,13 @@ pub extern "C" fn vldb_sqlite_execute_result_statements_executed(
 
 /// 释放 JSON 查询结果句柄。
 /// Destroy a JSON-query result handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live result handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的结果句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_query_json_result_destroy(
+pub unsafe extern "C" fn vldb_sqlite_query_json_result_destroy(
     handle: *mut VldbSqliteQueryJsonResultHandle,
 ) {
     if handle.is_null() {
@@ -1696,8 +1732,15 @@ pub extern "C" fn vldb_sqlite_query_json_result_row_count(
 
 /// 释放 Arrow IPC chunk 查询结果句柄。
 /// Destroy an Arrow IPC chunk query-result handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live stream handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的流句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_query_stream_destroy(handle: *mut VldbSqliteQueryStreamHandle) {
+pub unsafe extern "C" fn vldb_sqlite_query_stream_destroy(
+    handle: *mut VldbSqliteQueryStreamHandle,
+) {
     if handle.is_null() {
         return;
     }
@@ -1779,10 +1822,12 @@ pub extern "C" fn vldb_sqlite_query_stream_get_chunk(
     clear_last_error_inner();
     match (|| -> Result<VldbSqliteByteBuffer, String> {
         let handle = query_stream_handle_ref(handle)?;
-        let chunk = handle.inner.read_chunk(
-            usize::try_from(index)
-                .map_err(|_| "chunk index exceeds usize / chunk 下标超过 usize".to_string())?,
-        )?;
+        let chunk =
+            handle
+                .inner
+                .read_chunk(usize::try_from(index).map_err(|_| {
+                    "chunk index exceeds usize / chunk 下标超过 usize".to_string()
+                })?)?;
         Ok(bytes_to_buffer(&chunk))
     })() {
         Ok(buffer) => buffer,
@@ -1829,8 +1874,13 @@ pub extern "C" fn vldb_sqlite_database_tokenize_text(
 
 /// 释放分词结果句柄。
 /// Destroy a tokenize-result handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live result handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的结果句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_tokenize_result_destroy(
+pub unsafe extern "C" fn vldb_sqlite_tokenize_result_destroy(
     handle: *mut VldbSqliteTokenizeResultHandle,
 ) {
     if handle.is_null() {
@@ -1922,8 +1972,14 @@ pub extern "C" fn vldb_sqlite_tokenize_result_get_token(
 
 /// 通过数据库句柄热更新自定义词。
 /// Hot-update a custom word through a database handle.
+///
+/// # Safety
+///
+/// `handle` must be live, `word` must reference a readable NUL-terminated string, and
+/// `out_result` must reference writable storage for one result value.
+/// `handle` 必须有效，`word` 必须指向可读的 NUL 结尾字符串，`out_result` 必须指向一个结果值的可写空间。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_database_upsert_custom_word(
+pub unsafe extern "C" fn vldb_sqlite_database_upsert_custom_word(
     handle: *mut VldbSqliteDatabaseHandle,
     word: *const c_char,
     weight: u64,
@@ -1967,8 +2023,14 @@ pub extern "C" fn vldb_sqlite_database_upsert_custom_word(
 
 /// 通过数据库句柄删除自定义词。
 /// Remove a custom word through a database handle.
+///
+/// # Safety
+///
+/// `handle` must be live, `word` must reference a readable NUL-terminated string, and
+/// `out_result` must reference writable storage for one result value.
+/// `handle` 必须有效，`word` 必须指向可读的 NUL 结尾字符串，`out_result` 必须指向一个结果值的可写空间。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_database_remove_custom_word(
+pub unsafe extern "C" fn vldb_sqlite_database_remove_custom_word(
     handle: *mut VldbSqliteDatabaseHandle,
     word: *const c_char,
     out_result: *mut VldbSqliteDictionaryMutationResultPod,
@@ -2032,8 +2094,13 @@ pub extern "C" fn vldb_sqlite_database_list_custom_words(
 
 /// 释放自定义词列表句柄。
 /// Destroy a custom-word list handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live list handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的列表句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_custom_word_list_destroy(
+pub unsafe extern "C" fn vldb_sqlite_custom_word_list_destroy(
     handle: *mut VldbSqliteCustomWordListHandle,
 ) {
     if handle.is_null() {
@@ -2120,8 +2187,14 @@ pub extern "C" fn vldb_sqlite_custom_word_list_get_weight(
 
 /// 通过数据库句柄确保 FTS 索引存在。
 /// Ensure an FTS index exists through a database handle.
+///
+/// # Safety
+///
+/// `handle` must be live, `index_name` must reference a readable NUL-terminated string, and
+/// `out_result` must reference writable storage for one result value.
+/// `handle` 必须有效，`index_name` 必须指向可读的 NUL 结尾字符串，`out_result` 必须指向一个结果值的可写空间。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_database_ensure_fts_index(
+pub unsafe extern "C" fn vldb_sqlite_database_ensure_fts_index(
     handle: *mut VldbSqliteDatabaseHandle,
     index_name: *const c_char,
     tokenizer_mode: VldbSqliteFfiTokenizerMode,
@@ -2140,7 +2213,8 @@ pub extern "C" fn vldb_sqlite_database_ensure_fts_index(
             parse_ffi_tokenizer_mode(tokenizer_mode),
         )
         .map_err(|error| format!("ensure_fts_index failed: {error}"))?;
-        let effective_mode = TokenizerMode::parse(result.tokenizer_mode.as_str()).unwrap_or_default();
+        let effective_mode =
+            TokenizerMode::parse(result.tokenizer_mode.as_str()).unwrap_or_default();
         Ok(VldbSqliteEnsureFtsIndexResultPod {
             success: if result.success { 1 } else { 0 },
             tokenizer_mode: ffi_tokenizer_mode_code(effective_mode),
@@ -2163,8 +2237,14 @@ pub extern "C" fn vldb_sqlite_database_ensure_fts_index(
 
 /// 通过数据库句柄重建 FTS 索引。
 /// Rebuild an FTS index through a database handle.
+///
+/// # Safety
+///
+/// `handle` must be live, `index_name` must reference a readable NUL-terminated string, and
+/// `out_result` must reference writable storage for one result value.
+/// `handle` 必须有效，`index_name` 必须指向可读的 NUL 结尾字符串，`out_result` 必须指向一个结果值的可写空间。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_database_rebuild_fts_index(
+pub unsafe extern "C" fn vldb_sqlite_database_rebuild_fts_index(
     handle: *mut VldbSqliteDatabaseHandle,
     index_name: *const c_char,
     tokenizer_mode: VldbSqliteFfiTokenizerMode,
@@ -2183,7 +2263,8 @@ pub extern "C" fn vldb_sqlite_database_rebuild_fts_index(
             parse_ffi_tokenizer_mode(tokenizer_mode),
         )
         .map_err(|error| format!("rebuild_fts_index failed: {error}"))?;
-        let effective_mode = TokenizerMode::parse(result.tokenizer_mode.as_str()).unwrap_or_default();
+        let effective_mode =
+            TokenizerMode::parse(result.tokenizer_mode.as_str()).unwrap_or_default();
         Ok(VldbSqliteRebuildFtsIndexResultPod {
             success: if result.success { 1 } else { 0 },
             tokenizer_mode: ffi_tokenizer_mode_code(effective_mode),
@@ -2207,8 +2288,14 @@ pub extern "C" fn vldb_sqlite_database_rebuild_fts_index(
 
 /// 通过数据库句柄写入或更新 FTS 文档。
 /// Upsert an FTS document through a database handle.
+///
+/// # Safety
+///
+/// `handle` must be live, every non-null text pointer must reference a readable NUL-terminated
+/// string, and `out_result` must reference writable storage for one result value.
+/// `handle` 必须有效，每个非空文本指针必须指向可读的 NUL 结尾字符串，`out_result` 必须指向一个结果值的可写空间。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_database_upsert_fts_document(
+pub unsafe extern "C" fn vldb_sqlite_database_upsert_fts_document(
     handle: *mut VldbSqliteDatabaseHandle,
     index_name: *const c_char,
     tokenizer_mode: VldbSqliteFfiTokenizerMode,
@@ -2261,8 +2348,14 @@ pub extern "C" fn vldb_sqlite_database_upsert_fts_document(
 
 /// 通过数据库句柄删除 FTS 文档。
 /// Delete an FTS document through a database handle.
+///
+/// # Safety
+///
+/// `handle` must be live, `index_name` and `id` must reference readable NUL-terminated strings,
+/// and `out_result` must reference writable storage for one result value.
+/// `handle` 必须有效，`index_name` 与 `id` 必须指向可读的 NUL 结尾字符串，`out_result` 必须指向一个结果值的可写空间。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_database_delete_fts_document(
+pub unsafe extern "C" fn vldb_sqlite_database_delete_fts_document(
     handle: *mut VldbSqliteDatabaseHandle,
     index_name: *const c_char,
     id: *const c_char,
@@ -2339,8 +2432,13 @@ pub extern "C" fn vldb_sqlite_database_search_fts(
 
 /// 释放 FTS 检索结果句柄。
 /// Destroy an FTS search-result handle.
+///
+/// # Safety
+///
+/// `handle` must be null or a live result handle returned by this library and must be destroyed exactly once.
+/// `handle` 必须为空，或为本库返回且仍然有效的结果句柄，并且只能销毁一次。
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_search_result_destroy(
+pub unsafe extern "C" fn vldb_sqlite_search_result_destroy(
     handle: *mut VldbSqliteSearchResultHandle,
 ) {
     if handle.is_null() {
@@ -2374,9 +2472,7 @@ pub extern "C" fn vldb_sqlite_search_result_total(
 /// 返回 FTS 检索当前页命中数。
 /// Return the page hit count of an FTS search result.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_search_result_len(
-    handle: *mut VldbSqliteSearchResultHandle,
-) -> u64 {
+pub extern "C" fn vldb_sqlite_search_result_len(handle: *mut VldbSqliteSearchResultHandle) -> u64 {
     clear_last_error_inner();
     match search_result_handle_ref(handle) {
         Ok(handle) => handle.inner.hits.len() as u64,
@@ -2645,7 +2741,8 @@ pub extern "C" fn vldb_sqlite_execute_script_json(request_json: *const c_char) -
         let request: FfiExecuteScriptJsonRequest = serde_json::from_str(&request_json)
             .map_err(|error| format!("failed to parse execute_script request JSON: {error}"))?;
         let mut connection = open_connection_for_db_path(request.db_path.as_str())?;
-        let bound_values = parse_json_compat_params(request.params, request.params_json.as_deref())?;
+        let bound_values =
+            parse_json_compat_params(request.params, request.params_json.as_deref())?;
         let response = execute_script_core(&mut connection, &request.sql, &bound_values)
             .map_err(sql_exec_error_to_string)?;
         serde_json::to_string(&FfiExecuteJsonResponse {
@@ -2679,10 +2776,14 @@ pub extern "C" fn vldb_sqlite_execute_batch_json(request_json: *const c_char) ->
         let batch_params = request
             .items
             .into_iter()
-            .map(|row| row.into_iter().map(json_typed_value_to_sqlite_value).collect())
+            .map(|row| {
+                row.into_iter()
+                    .map(json_typed_value_to_sqlite_value)
+                    .collect()
+            })
             .collect::<Result<Vec<Vec<SqliteValue>>, String>>()?;
-        let response =
-            execute_batch_core(&mut connection, &request.sql, &batch_params).map_err(sql_exec_error_to_string)?;
+        let response = execute_batch_core(&mut connection, &request.sql, &batch_params)
+            .map_err(sql_exec_error_to_string)?;
         serde_json::to_string(&FfiExecuteBatchJsonResponse {
             success: response.success,
             message: response.message,
@@ -2712,9 +2813,10 @@ pub extern "C" fn vldb_sqlite_query_json_json(request_json: *const c_char) -> *m
         let request: FfiQueryJsonJsonRequest = serde_json::from_str(&request_json)
             .map_err(|error| format!("failed to parse query_json request JSON: {error}"))?;
         let mut connection = open_connection_for_db_path(request.db_path.as_str())?;
-        let bound_values = parse_json_compat_params(request.params, request.params_json.as_deref())?;
-        let response =
-            query_json_core(&mut connection, &request.sql, &bound_values).map_err(sql_exec_error_to_string)?;
+        let bound_values =
+            parse_json_compat_params(request.params, request.params_json.as_deref())?;
+        let response = query_json_core(&mut connection, &request.sql, &bound_values)
+            .map_err(sql_exec_error_to_string)?;
         serde_json::to_string(&response)
             .map_err(|error| format!("failed to serialize query_json response: {error}"))
     })();
@@ -2738,10 +2840,14 @@ pub extern "C" fn vldb_sqlite_query_stream_json(request_json: *const c_char) -> 
         let request: FfiQueryStreamJsonRequest = serde_json::from_str(&request_json)
             .map_err(|error| format!("failed to parse query_stream request JSON: {error}"))?;
         let mut connection = open_connection_for_db_path(request.db_path.as_str())?;
-        let bound_values = parse_json_compat_params(request.params, request.params_json.as_deref())?;
+        let bound_values =
+            parse_json_compat_params(request.params, request.params_json.as_deref())?;
         let chunk_bytes = request
             .chunk_bytes
-            .map(|value| usize::try_from(value).map_err(|_| "chunk_bytes exceeds usize / chunk_bytes 超过 usize".to_string()))
+            .map(|value| {
+                usize::try_from(value)
+                    .map_err(|_| "chunk_bytes exceeds usize / chunk_bytes 超过 usize".to_string())
+            })
             .transpose()?
             .unwrap_or(DEFAULT_IPC_CHUNK_BYTES);
         let response = query_stream_core(&mut connection, &request.sql, &bound_values, chunk_bytes)
@@ -2783,12 +2889,12 @@ pub extern "C" fn vldb_sqlite_query_stream_chunk_json(request_json: *const c_cha
         let request: FfiQueryStreamChunkJsonRequest = serde_json::from_str(&request_json)
             .map_err(|error| format!("failed to parse query_stream_chunk request JSON: {error}"))?;
         let response = with_json_query_stream(request.stream_id, |result| {
-            let chunk = result
-                .read_chunk(
-                    usize::try_from(request.index)
-                        .map_err(|_| "chunk index exceeds usize / chunk 下标超过 usize".to_string())?,
-                )
-                .map_err(sql_exec_error_to_string)?;
+            let chunk =
+                result
+                    .read_chunk(usize::try_from(request.index).map_err(|_| {
+                        "chunk index exceeds usize / chunk 下标超过 usize".to_string()
+                    })?)
+                    .map_err(sql_exec_error_to_string)?;
             Ok(FfiQueryStreamChunkJsonResponse {
                 success: true,
                 message: format!(
@@ -2833,7 +2939,10 @@ pub extern "C" fn vldb_sqlite_query_stream_close_json(request_json: *const c_cha
         }
         serde_json::to_string(&FfiQueryStreamCloseJsonResponse {
             success: true,
-            message: format!("query_stream handle {} closed successfully", request.stream_id),
+            message: format!(
+                "query_stream handle {} closed successfully",
+                request.stream_id
+            ),
             stream_id: request.stream_id,
         })
         .map_err(|error| format!("failed to serialize query_stream_close response: {error}"))
@@ -2855,10 +2964,8 @@ pub extern "C" fn vldb_sqlite_tokenize_text_json(request_json: *const c_char) ->
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
-        let request: FfiTokenizeTextRequest =
-            serde_json::from_str(&request_json).map_err(|error| {
-                format!("failed to parse tokenize request JSON: {error}")
-            })?;
+        let request: FfiTokenizeTextRequest = serde_json::from_str(&request_json)
+            .map_err(|error| format!("failed to parse tokenize request JSON: {error}"))?;
         let mode = request
             .tokenizer_mode
             .as_deref()
@@ -2903,16 +3010,12 @@ pub extern "C" fn vldb_sqlite_tokenize_text_json(request_json: *const c_char) ->
 /// 通过 JSON 请求热更新自定义词。
 /// Hot-update a custom dictionary word from a JSON request.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_upsert_custom_word_json(
-    request_json: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn vldb_sqlite_upsert_custom_word_json(request_json: *const c_char) -> *mut c_char {
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
-        let request: FfiUpsertCustomWordRequest =
-            serde_json::from_str(&request_json).map_err(|error| {
-                format!("failed to parse upsert request JSON: {error}")
-            })?;
+        let request: FfiUpsertCustomWordRequest = serde_json::from_str(&request_json)
+            .map_err(|error| format!("failed to parse upsert request JSON: {error}"))?;
         let connection = open_connection_for_db_path(request.db_path.as_str())?;
         let response = upsert_custom_word(
             &connection,
@@ -2936,16 +3039,12 @@ pub extern "C" fn vldb_sqlite_upsert_custom_word_json(
 /// 通过 JSON 请求删除自定义词。
 /// Remove a custom dictionary word from a JSON request.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_remove_custom_word_json(
-    request_json: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn vldb_sqlite_remove_custom_word_json(request_json: *const c_char) -> *mut c_char {
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
-        let request: FfiRemoveCustomWordRequest =
-            serde_json::from_str(&request_json).map_err(|error| {
-                format!("failed to parse remove request JSON: {error}")
-            })?;
+        let request: FfiRemoveCustomWordRequest = serde_json::from_str(&request_json)
+            .map_err(|error| format!("failed to parse remove request JSON: {error}"))?;
         let connection = open_connection_for_db_path(request.db_path.as_str())?;
         let response = remove_custom_word(&connection, request.word.as_str())
             .map_err(|error| format!("remove_custom_word failed: {error}"))?;
@@ -2965,16 +3064,12 @@ pub extern "C" fn vldb_sqlite_remove_custom_word_json(
 /// 通过 JSON 请求列出当前库中的自定义词。
 /// List custom dictionary words from a JSON request.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_list_custom_words_json(
-    request_json: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn vldb_sqlite_list_custom_words_json(request_json: *const c_char) -> *mut c_char {
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
-        let request: FfiListCustomWordsRequest =
-            serde_json::from_str(&request_json).map_err(|error| {
-                format!("failed to parse list_custom_words request JSON: {error}")
-            })?;
+        let request: FfiListCustomWordsRequest = serde_json::from_str(&request_json)
+            .map_err(|error| format!("failed to parse list_custom_words request JSON: {error}"))?;
         let connection = open_connection_for_db_path(request.db_path.as_str())?;
         let response = list_custom_words(&connection)
             .map_err(|error| format!("list_custom_words failed: {error}"))?;
@@ -2994,9 +3089,7 @@ pub extern "C" fn vldb_sqlite_list_custom_words_json(
 /// 通过 JSON 请求确保 FTS 索引存在。
 /// Ensure an FTS index exists from a JSON request.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_ensure_fts_index_json(
-    request_json: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn vldb_sqlite_ensure_fts_index_json(request_json: *const c_char) -> *mut c_char {
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
@@ -3026,9 +3119,7 @@ pub extern "C" fn vldb_sqlite_ensure_fts_index_json(
 /// 通过 JSON 请求重建 FTS 索引。
 /// Rebuild an FTS index from a JSON request.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_rebuild_fts_index_json(
-    request_json: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn vldb_sqlite_rebuild_fts_index_json(request_json: *const c_char) -> *mut c_char {
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
@@ -3058,14 +3149,14 @@ pub extern "C" fn vldb_sqlite_rebuild_fts_index_json(
 /// 通过 JSON 请求写入 FTS 文档。
 /// Upsert an FTS document from a JSON request.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_upsert_fts_document_json(
-    request_json: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn vldb_sqlite_upsert_fts_document_json(request_json: *const c_char) -> *mut c_char {
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
-        let request: FfiUpsertFtsDocumentRequest = serde_json::from_str(&request_json)
-            .map_err(|error| format!("failed to parse upsert_fts_document request JSON: {error}"))?;
+        let request: FfiUpsertFtsDocumentRequest =
+            serde_json::from_str(&request_json).map_err(|error| {
+                format!("failed to parse upsert_fts_document request JSON: {error}")
+            })?;
         let connection = open_connection_for_db_path(request.db_path.as_str())?;
         let mode = request
             .tokenizer_mode
@@ -3098,14 +3189,14 @@ pub extern "C" fn vldb_sqlite_upsert_fts_document_json(
 /// 通过 JSON 请求删除 FTS 文档。
 /// Delete an FTS document from a JSON request.
 #[unsafe(no_mangle)]
-pub extern "C" fn vldb_sqlite_delete_fts_document_json(
-    request_json: *const c_char,
-) -> *mut c_char {
+pub extern "C" fn vldb_sqlite_delete_fts_document_json(request_json: *const c_char) -> *mut c_char {
     clear_last_error_inner();
     let result = (|| -> Result<String, String> {
         let request_json = c_json_arg_to_string(request_json)?;
-        let request: FfiDeleteFtsDocumentRequest = serde_json::from_str(&request_json)
-            .map_err(|error| format!("failed to parse delete_fts_document request JSON: {error}"))?;
+        let request: FfiDeleteFtsDocumentRequest =
+            serde_json::from_str(&request_json).map_err(|error| {
+                format!("failed to parse delete_fts_document request JSON: {error}")
+            })?;
         let connection = open_connection_for_db_path(request.db_path.as_str())?;
         let response = delete_fts_document(
             &connection,
@@ -3167,21 +3258,20 @@ pub extern "C" fn vldb_sqlite_search_fts_json(request_json: *const c_char) -> *m
 mod tests {
     use super::{
         VldbSqliteFfiValue, VldbSqliteFfiValueKind, VldbSqliteFfiValueSlice,
-        vldb_sqlite_clear_last_error, vldb_sqlite_database_execute_batch,
+        vldb_sqlite_bytes_free, vldb_sqlite_clear_last_error, vldb_sqlite_database_execute_batch,
         vldb_sqlite_database_execute_script, vldb_sqlite_database_query_json,
         vldb_sqlite_database_query_stream, vldb_sqlite_execute_result_destroy,
         vldb_sqlite_execute_result_rows_changed, vldb_sqlite_execute_result_statements_executed,
         vldb_sqlite_json_is_null, vldb_sqlite_last_error_message, vldb_sqlite_library_info_json,
         vldb_sqlite_query_json_json, vldb_sqlite_query_json_result_destroy,
         vldb_sqlite_query_json_result_json_data, vldb_sqlite_query_stream_chunk_count,
-        vldb_sqlite_query_stream_close_json, vldb_sqlite_query_stream_destroy,
-        vldb_sqlite_query_stream_get_chunk, vldb_sqlite_query_stream_json,
-        vldb_sqlite_query_stream_chunk_json, vldb_sqlite_runtime_create_default,
+        vldb_sqlite_query_stream_chunk_json, vldb_sqlite_query_stream_close_json,
+        vldb_sqlite_query_stream_destroy, vldb_sqlite_query_stream_get_chunk,
+        vldb_sqlite_query_stream_json, vldb_sqlite_runtime_create_default,
         vldb_sqlite_runtime_destroy, vldb_sqlite_runtime_open_database, vldb_sqlite_string_free,
-        vldb_sqlite_bytes_free,
     };
-    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
     use serde_json::Value as JsonValue;
     use std::ffi::{CStr, CString, c_char};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3263,7 +3353,11 @@ mod tests {
                 .any(|entry| entry == "query_stream_chunk_json")
         );
 
-        vldb_sqlite_string_free(raw);
+        // SAFETY: `raw` is the live string pointer returned by `vldb_sqlite_library_info_json`.
+        // 安全性：`raw` 是 `vldb_sqlite_library_info_json` 返回且仍然有效的字符串指针。
+        unsafe {
+            vldb_sqlite_string_free(raw);
+        }
     }
 
     #[test]
@@ -3285,11 +3379,23 @@ mod tests {
         let create_sql = make_c_string(
             "CREATE TABLE demo(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, score REAL);",
         );
-        let create_result =
-            vldb_sqlite_database_execute_script(db, create_sql.as_ptr(), std::ptr::null(), 0, std::ptr::null());
+        let create_result = vldb_sqlite_database_execute_script(
+            db,
+            create_sql.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        );
         assert!(!create_result.is_null());
-        assert_eq!(vldb_sqlite_execute_result_statements_executed(create_result), 1);
-        vldb_sqlite_execute_result_destroy(create_result);
+        assert_eq!(
+            vldb_sqlite_execute_result_statements_executed(create_result),
+            1
+        );
+        // SAFETY: `create_result` is a live result handle returned by this library.
+        // 安全性：`create_result` 是本库返回且仍然有效的结果句柄。
+        unsafe {
+            vldb_sqlite_execute_result_destroy(create_result);
+        }
 
         let insert_sql = make_c_string("INSERT INTO demo(name, score) VALUES (?1, ?2)");
         let name = make_c_string("alpha");
@@ -3320,20 +3426,35 @@ mod tests {
         );
         assert!(!insert_result.is_null());
         assert_eq!(vldb_sqlite_execute_result_rows_changed(insert_result), 1);
-        assert_eq!(vldb_sqlite_execute_result_statements_executed(insert_result), 1);
-        vldb_sqlite_execute_result_destroy(insert_result);
+        assert_eq!(
+            vldb_sqlite_execute_result_statements_executed(insert_result),
+            1
+        );
+        // SAFETY: `insert_result` is a live result handle returned by this library.
+        // 安全性：`insert_result` 是本库返回且仍然有效的结果句柄。
+        unsafe {
+            vldb_sqlite_execute_result_destroy(insert_result);
+        }
 
         let query_sql = make_c_string("SELECT id, name, score FROM demo ORDER BY id");
-        let query_result =
-            vldb_sqlite_database_query_json(db, query_sql.as_ptr(), std::ptr::null(), 0, std::ptr::null());
+        let query_result = vldb_sqlite_database_query_json(
+            db,
+            query_sql.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        );
         assert!(!query_result.is_null());
         let json_ptr = vldb_sqlite_query_json_result_json_data(query_result);
         let json = c_string_to_string(json_ptr).expect("query_json result should be readable");
         assert!(json.contains("\"alpha\""));
-        vldb_sqlite_string_free(json_ptr);
-        vldb_sqlite_query_json_result_destroy(query_result);
-
-        vldb_sqlite_runtime_destroy(runtime);
+        // SAFETY: every pointer below is live and was returned by the matching library constructor.
+        // 安全性：下列每个指针均有效，并由本库对应的构造函数返回。
+        unsafe {
+            vldb_sqlite_string_free(json_ptr);
+            vldb_sqlite_query_json_result_destroy(query_result);
+            vldb_sqlite_runtime_destroy(runtime);
+        }
     }
 
     #[test]
@@ -3348,10 +3469,19 @@ mod tests {
         let create_sql = make_c_string(
             "CREATE TABLE demo(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, score REAL);",
         );
-        let create_result =
-            vldb_sqlite_database_execute_script(db, create_sql.as_ptr(), std::ptr::null(), 0, std::ptr::null());
+        let create_result = vldb_sqlite_database_execute_script(
+            db,
+            create_sql.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        );
         assert!(!create_result.is_null());
-        vldb_sqlite_execute_result_destroy(create_result);
+        // SAFETY: `create_result` is a live result handle returned by this library.
+        // 安全性：`create_result` 是本库返回且仍然有效的结果句柄。
+        unsafe {
+            vldb_sqlite_execute_result_destroy(create_result);
+        }
 
         let sql = make_c_string("INSERT INTO demo(name, score) VALUES (?1, ?2)");
         let alpha = make_c_string("alpha");
@@ -3402,23 +3532,43 @@ mod tests {
                 len: row2.len() as u64,
             },
         ];
-        let batch_result =
-            vldb_sqlite_database_execute_batch(db, sql.as_ptr(), items.as_ptr(), items.len() as u64);
+        let batch_result = vldb_sqlite_database_execute_batch(
+            db,
+            sql.as_ptr(),
+            items.as_ptr(),
+            items.len() as u64,
+        );
         assert!(!batch_result.is_null());
-        assert_eq!(vldb_sqlite_execute_result_statements_executed(batch_result), 2);
-        vldb_sqlite_execute_result_destroy(batch_result);
+        assert_eq!(
+            vldb_sqlite_execute_result_statements_executed(batch_result),
+            2
+        );
+        // SAFETY: `batch_result` is a live result handle returned by this library.
+        // 安全性：`batch_result` 是本库返回且仍然有效的结果句柄。
+        unsafe {
+            vldb_sqlite_execute_result_destroy(batch_result);
+        }
 
         let query_sql = make_c_string("SELECT id, name, score FROM demo ORDER BY id");
-        let stream =
-            vldb_sqlite_database_query_stream(db, query_sql.as_ptr(), std::ptr::null(), 0, std::ptr::null(), 0);
+        let stream = vldb_sqlite_database_query_stream(
+            db,
+            query_sql.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
+        );
         assert!(!stream.is_null());
         assert!(vldb_sqlite_query_stream_chunk_count(stream) >= 1);
         let chunk = vldb_sqlite_query_stream_get_chunk(stream, 0);
         assert!(chunk.len > 0);
         vldb_sqlite_bytes_free(chunk);
-        vldb_sqlite_query_stream_destroy(stream);
-
-        vldb_sqlite_runtime_destroy(runtime);
+        // SAFETY: both handles are live and were returned by this library.
+        // 安全性：两个句柄均有效，并由本库返回。
+        unsafe {
+            vldb_sqlite_query_stream_destroy(stream);
+            vldb_sqlite_runtime_destroy(runtime);
+        }
     }
 
     #[test]
@@ -3431,9 +3581,18 @@ mod tests {
         let create_sql = make_c_string(
             "CREATE TABLE demo(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, score REAL);",
         );
-        let create_result =
-            vldb_sqlite_database_execute_script(db, create_sql.as_ptr(), std::ptr::null(), 0, std::ptr::null());
-        vldb_sqlite_execute_result_destroy(create_result);
+        let create_result = vldb_sqlite_database_execute_script(
+            db,
+            create_sql.as_ptr(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+        );
+        // SAFETY: `create_result` is a live result handle returned by this library.
+        // 安全性：`create_result` 是本库返回且仍然有效的结果句柄。
+        unsafe {
+            vldb_sqlite_execute_result_destroy(create_result);
+        }
 
         let insert_json = serde_json::json!({
             "db_path": db_path,
@@ -3447,7 +3606,11 @@ mod tests {
         let insert_json_c = make_c_string(&insert_json);
         let insert_json_result = super::vldb_sqlite_execute_script_json(insert_json_c.as_ptr());
         assert!(!insert_json_result.is_null());
-        vldb_sqlite_string_free(insert_json_result);
+        // SAFETY: `insert_json_result` is a live string pointer returned by this library.
+        // 安全性：`insert_json_result` 是本库返回且仍然有效的字符串指针。
+        unsafe {
+            vldb_sqlite_string_free(insert_json_result);
+        }
 
         let query_sql = make_c_string("SELECT id, name, score FROM demo WHERE name = ?1");
         let name = make_c_string("alpha");
@@ -3468,8 +3631,12 @@ mod tests {
         );
         let typed_json_ptr = vldb_sqlite_query_json_result_json_data(typed_result);
         let typed_json = c_string_to_string(typed_json_ptr).expect("typed query json should exist");
-        vldb_sqlite_string_free(typed_json_ptr);
-        vldb_sqlite_query_json_result_destroy(typed_result);
+        // SAFETY: both pointers are live and were returned by this library.
+        // 安全性：两个指针均有效，并由本库返回。
+        unsafe {
+            vldb_sqlite_string_free(typed_json_ptr);
+            vldb_sqlite_query_json_result_destroy(typed_result);
+        }
 
         let query_json_request = serde_json::json!({
             "db_path": db_path,
@@ -3480,9 +3647,17 @@ mod tests {
         let query_json_request_c = make_c_string(&query_json_request);
         let query_json_ptr = vldb_sqlite_query_json_json(query_json_request_c.as_ptr());
         let query_json = c_string_to_string(query_json_ptr).expect("json query should exist");
-        vldb_sqlite_string_free(query_json_ptr);
+        // SAFETY: `query_json_ptr` is a live string pointer returned by this library.
+        // 安全性：`query_json_ptr` 是本库返回且仍然有效的字符串指针。
+        unsafe {
+            vldb_sqlite_string_free(query_json_ptr);
+        }
 
-        assert_eq!(typed_json, serde_json::from_str::<JsonValue>(&query_json).expect("query_json_json should return serializable response")["json_data"]);
+        assert_eq!(
+            typed_json,
+            serde_json::from_str::<JsonValue>(&query_json)
+                .expect("query_json_json should return serializable response")["json_data"]
+        );
 
         let stream_json_request = serde_json::json!({
             "db_path": db_path,
@@ -3492,12 +3667,20 @@ mod tests {
         .to_string();
         let stream_json_request_c = make_c_string(&stream_json_request);
         let stream_json_ptr = vldb_sqlite_query_stream_json(stream_json_request_c.as_ptr());
-        let stream_json = c_string_to_string(stream_json_ptr).expect("query_stream_json should exist");
-        let stream_payload: JsonValue = serde_json::from_str(&stream_json).expect("stream JSON should parse");
-        let stream_id = stream_payload["stream_id"].as_u64().expect("stream_id should exist");
+        let stream_json =
+            c_string_to_string(stream_json_ptr).expect("query_stream_json should exist");
+        let stream_payload: JsonValue =
+            serde_json::from_str(&stream_json).expect("stream JSON should parse");
+        let stream_id = stream_payload["stream_id"]
+            .as_u64()
+            .expect("stream_id should exist");
         assert!(stream_payload["chunk_count"].as_u64().unwrap_or(0) >= 1);
         assert!(stream_payload.get("chunks").is_none());
-        vldb_sqlite_string_free(stream_json_ptr);
+        // SAFETY: `stream_json_ptr` is a live string pointer returned by this library.
+        // 安全性：`stream_json_ptr` 是本库返回且仍然有效的字符串指针。
+        unsafe {
+            vldb_sqlite_string_free(stream_json_ptr);
+        }
 
         let chunk_request = serde_json::json!({
             "stream_id": stream_id,
@@ -3506,8 +3689,10 @@ mod tests {
         .to_string();
         let chunk_request_c = make_c_string(&chunk_request);
         let chunk_json_ptr = vldb_sqlite_query_stream_chunk_json(chunk_request_c.as_ptr());
-        let chunk_json = c_string_to_string(chunk_json_ptr).expect("query_stream_chunk_json should exist");
-        let chunk_payload: JsonValue = serde_json::from_str(&chunk_json).expect("chunk JSON should parse");
+        let chunk_json =
+            c_string_to_string(chunk_json_ptr).expect("query_stream_chunk_json should exist");
+        let chunk_payload: JsonValue =
+            serde_json::from_str(&chunk_json).expect("chunk JSON should parse");
         assert!(chunk_payload["byte_count"].as_u64().unwrap_or(0) > 0);
         let chunk_base64 = chunk_payload["chunk_base64"]
             .as_str()
@@ -3516,7 +3701,11 @@ mod tests {
             .decode(chunk_base64)
             .expect("chunk_base64 should decode");
         assert!(!decoded_chunk.is_empty());
-        vldb_sqlite_string_free(chunk_json_ptr);
+        // SAFETY: `chunk_json_ptr` is a live string pointer returned by this library.
+        // 安全性：`chunk_json_ptr` 是本库返回且仍然有效的字符串指针。
+        unsafe {
+            vldb_sqlite_string_free(chunk_json_ptr);
+        }
 
         let close_request = serde_json::json!({
             "stream_id": stream_id
@@ -3525,9 +3714,12 @@ mod tests {
         let close_request_c = make_c_string(&close_request);
         let close_ptr = vldb_sqlite_query_stream_close_json(close_request_c.as_ptr());
         assert!(!close_ptr.is_null());
-        vldb_sqlite_string_free(close_ptr);
-
-        vldb_sqlite_runtime_destroy(runtime);
+        // SAFETY: both pointers are live and were returned by this library.
+        // 安全性：两个指针均有效，并由本库返回。
+        unsafe {
+            vldb_sqlite_string_free(close_ptr);
+            vldb_sqlite_runtime_destroy(runtime);
+        }
     }
 
     #[test]
@@ -3540,9 +3732,15 @@ mod tests {
         .to_string();
         let create_json_c = make_c_string(&create_json);
         let create_ptr = super::vldb_sqlite_execute_script_json(create_json_c.as_ptr());
-        let create_payload = c_string_to_string(create_ptr).expect("execute_script_json should succeed");
-        let create_value: JsonValue = serde_json::from_str(&create_payload).expect("create response should parse");
+        let create_payload =
+            c_string_to_string(create_ptr).expect("execute_script_json should succeed");
+        let create_value: JsonValue =
+            serde_json::from_str(&create_payload).expect("create response should parse");
         assert_eq!(create_value["success"], true);
-        vldb_sqlite_string_free(create_ptr);
+        // SAFETY: `create_ptr` is a live string pointer returned by this library.
+        // 安全性：`create_ptr` 是本库返回且仍然有效的字符串指针。
+        unsafe {
+            vldb_sqlite_string_free(create_ptr);
+        }
     }
 }
