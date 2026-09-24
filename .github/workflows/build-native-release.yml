@@ -145,6 +145,27 @@ jobs:
           echo "release_tag=$resolved_tag" >> "$GITHUB_OUTPUT"
           echo "checkout_ref=refs/tags/$resolved_tag" >> "$GITHUB_OUTPUT"
 
+      # Published bytes are immutable; only absent or draft releases may be built again.
+      # 已公开字节不可变；仅允许重新构建尚不存在或仍为草稿的发行。
+      - name: Reject rebuilding a published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.matrix.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" > "$RUNNER_TEMP/releases.json"
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          pages = json.loads((Path(os.environ['RUNNER_TEMP']) / 'releases.json').read_text())
+          for page in pages:
+              for release in page:
+                  if release['tag_name'] == os.environ['RELEASE_TAG'] and not release['draft']:
+                      raise SystemExit('Published release assets cannot be overwritten; use a new version')
+          PY
+
   build:
     needs: prepare-matrix
     name: ${{ matrix.target }}
