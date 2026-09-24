@@ -72,6 +72,12 @@ cargo build --release
 
 The platform-specific shared library is emitted under `target/release`.
 
+### Native release v0.1.7
+
+The v0.1.7 native release fixes file-lock contention: a second owner is rejected with `WouldBlock` before the lock file is modified. All native release targets run the library regression suite before uploading assets. The workflow stages a draft; publish it only after every target and the downloaded checksums have been verified. GitHub native releases and crates.io publication are separate operations.
+
+v0.1.7 原生发行修复了文件锁竞争：第二个持有者会在修改锁文件之前收到 `WouldBlock`。每个原生发行目标都会先执行库回归测试，再上传资产。工作流保留草稿，只有全部目标及下载摘要核验成功后才公开。GitHub 原生发行与 crates.io 发布是独立操作。
+
 ## Documentation
 
 - [English guide](https://github.com/OpenVulcan/vldb-sqlite/blob/main/docs/README.en.md)

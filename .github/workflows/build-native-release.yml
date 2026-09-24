@@ -273,6 +273,17 @@ jobs:
           CXX_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-g++"
         run: cargo build --locked --release --target ${{ matrix.target }} --bin vldb-sqlite --lib
 
+      # Run the real lock regression on each native target before any release upload.
+      # 在每个原生目标上执行真实文件锁回归，全部通过后才允许上传发行资产。
+      - name: Test release library on its native architecture
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "12.0"
+          CMAKE_OSX_ARCHITECTURES: ${{ matrix.target == 'aarch64-apple-darwin' && 'arm64' || matrix.target == 'x86_64-apple-darwin' && 'x86_64' || '' }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc"
+          CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc"
+          CXX_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-g++"
+        run: cargo test --locked --release --target ${{ matrix.target }} --lib
+
       - name: Package release archives on Windows runner
         if: runner.os == 'Windows'
         shell: pwsh
@@ -473,12 +484,14 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Publish node artifacts to GitHub Release
+      - name: Upload verified node artifacts to a draft release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare-matrix.outputs.release_tag }}
           name: ${{ needs.prepare-matrix.outputs.release_tag }}
-          draft: false
+          # Publish only after all five targets and the downloaded archive checks have passed.
+          # 仅在五个目标及下载后的压缩包检查全部通过后公开发行。
+          draft: true
           prerelease: false
           overwrite_files: true
           fail_on_unmatched_files: false
