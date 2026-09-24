@@ -185,9 +185,12 @@ jobs:
       - name: Install macOS build dependencies
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: '1'
         run: |
           set -euo pipefail
-          brew update
+          # Prepare only missing tools; a global Homebrew refresh is unrelated to this pinned Rust release.
+          # 仅补齐缺失工具；全局更新 Homebrew 与本次固定 Rust 发行无关。
           if ! command -v cmake >/dev/null 2>&1; then
             brew install cmake
           fi
